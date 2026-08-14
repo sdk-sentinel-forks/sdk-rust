@@ -83,8 +83,7 @@ where
         let post_activate = historator.get_post_activate_hook();
         let shutdown_tok = historator.get_shutdown_setter();
         // Create a mock client which can be used by a replay worker to serve up canned histories.
-        // It will return the entire history in one workflow task. If a workflow task failure is
-        // sent to the mock, it will send the complete response again.
+        // It will return the entire history in one workflow task.
         //
         // Once it runs out of histories to return, it will serve up default responses after a 10s
         // delay
@@ -100,7 +99,6 @@ where
             .times(0..)
             .returning(|| async { Ok(DescribeNamespaceResponse::default()) }.boxed());
 
-        let hist_allow_tx = historator.replay_done_tx.clone();
         let historator = Arc::new(TokioMutex::new(historator));
 
         // TODO: Should use `new_with_pollers` and avoid re-doing mocking stuff
@@ -132,10 +130,11 @@ where
         client.expect_complete_workflow_task().returning(move |_a| {
             async move { Ok(RespondWorkflowTaskCompletedResponse::default()) }.boxed()
         });
+        // Failed replays produce an eviction activation. The post-activation hook advances only
+        // after that eviction so its reason cannot be lost to shutdown of an exhausted stream.
         client
             .expect_fail_workflow_task()
             .returning(move |_, _, _| {
-                hist_allow_tx.send("Failed".to_string()).unwrap();
                 async move { Ok(RespondWorkflowTaskFailedResponse::default()) }.boxed()
             });
         let mut worker = Worker::new(self.config, None, Arc::new(client), None, None, None)?;

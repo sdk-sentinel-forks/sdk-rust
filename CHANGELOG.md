@@ -132,6 +132,8 @@ relevant information.
   Non-validation failures are reported as `WorkerRunError::Fatal` with a message and source.
 
 ### Fixed
+* `WorkflowReplayer` now waits for a failed replay's eviction before advancing to the next history,
+  so multi-history replay results consistently include nondeterminism failures.
 * Unhandled workflow payload conversion errors now fail the Workflow Task so it can retry instead
   of failing the Workflow Execution. Workflows may still explicitly handle these errors.
 * Workers no longer send worker heartbeats or appear in centralized heartbeat reports before

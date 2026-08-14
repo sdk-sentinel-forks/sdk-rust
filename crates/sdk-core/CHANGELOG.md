@@ -48,6 +48,8 @@ relevant information.
   are preserved on failure; workers warn when the server does not advertise support.
 
 ### Fixed
+* Replay workers now finish processing a failed history's eviction before advancing to the next
+  history, preventing nondeterminism results from being dropped during multi-history replay.
 * Workers no longer send worker heartbeats or appear in centralized heartbeat reports before they
   begin polling.
 * Ephemeral server processes no longer leak on failed start.
