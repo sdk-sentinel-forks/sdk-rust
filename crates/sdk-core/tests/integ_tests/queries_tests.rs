@@ -73,10 +73,9 @@ async fn simple_query_legacy() {
         .unwrap()
     };
     let workflow_completions_future = async {
-        // Give query a beat to get going
+        // Let the query reach the server before completing the outstanding timer task so the
+        // server sends the query activation next.
         tokio::time::sleep(Duration::from_millis(400)).await;
-        // This task *should* have the `queries` field populated, but doesn't, seemingly due to
-        // a server bug. Complete it with no commands so the server sends a query activation.
         core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
             timer_task.run_id,
             vec![],
