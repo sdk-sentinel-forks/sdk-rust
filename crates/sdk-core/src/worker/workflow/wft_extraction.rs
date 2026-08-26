@@ -10,9 +10,17 @@ use crate::{
         },
     },
 };
-use futures_util::{FutureExt, Stream, StreamExt, stream, stream::PollNext};
-use std::{future, sync::Arc};
+use futures_util::{
+    FutureExt, Stream, StreamExt,
+    future::BoxFuture,
+    stream::{self, PollNext},
+};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use temporalio_common::protos::{TaskToken, coresdk::WorkflowSlotInfo};
+use tokio::sync::Notify;
 use tracing::Span;
 
 /// Transforms incoming validated WFTs and history fetching requests into [PermittedWFT]s ready
@@ -40,6 +48,12 @@ pub(super) enum WFTExtractorOutput {
     PollerDead,
 }
 
+enum BufferedOutput {
+    WFT(Result<WFTExtractorOutput, tonic::Status>),
+    Fetch(Result<WFTExtractorOutput, tonic::Status>),
+    PollerDead,
+}
+
 pub(crate) type WFTStreamIn = Result<
     (
         ValidPollWFTQResponse,
@@ -64,11 +78,19 @@ impl WFTExtractor {
         fetch_stream: impl Stream<Item = HistoryFetchReq> + Send + 'static,
     ) -> impl Stream<Item = Result<WFTExtractorOutput, tonic::Status>> + Send + 'static {
         let fetch_client = client.clone();
+        // The unordered buffer can otherwise deliver poller shutdown before workflow tasks that
+        // were already received, so gate shutdown on those task outputs reaching the consumer.
+        let pending_wft_outputs = Arc::new(AtomicUsize::new(0));
+        let wft_output_delivered = Arc::new(Notify::new());
+        let pending_wft_outputs_for_tasks = pending_wft_outputs.clone();
+        let pending_wft_outputs_for_shutdown = pending_wft_outputs.clone();
+        let wft_output_delivered_for_shutdown = wft_output_delivered.clone();
         let wft_stream = wft_stream
             .map(move |stream_in| {
+                pending_wft_outputs_for_tasks.fetch_add(1, Ordering::Relaxed);
                 let client = client.clone();
                 async move {
-                    match stream_in {
+                    BufferedOutput::WFT(match stream_in {
                         Ok((wft, permit)) => {
                             let run_id = wft.workflow_execution.run_id.clone();
                             let tt = wft.task_token.clone();
@@ -89,16 +111,23 @@ impl WFTExtractor {
                             })
                         }
                         Err(e) => Err(e),
-                    }
+                    })
                 }
-                // This is... unattractive, but lets us avoid boxing all the futs in the stream
-                .left_future()
+                .right_future::<BoxFuture<'static, BufferedOutput>>()
                 .left_future()
             })
-            .chain(stream::iter([future::ready(Ok(
-                WFTExtractorOutput::PollerDead,
-            ))
-            .right_future()
+            .chain(stream::iter([async move {
+                loop {
+                    let delivered = wft_output_delivered_for_shutdown.notified();
+                    if pending_wft_outputs_for_shutdown.load(Ordering::Acquire) == 0 {
+                        break;
+                    }
+                    delivered.await;
+                }
+                BufferedOutput::PollerDead
+            }
+            .boxed()
+            .left_future()
             .left_future()]));
 
         stream::select_with_strategy(
@@ -106,7 +135,7 @@ impl WFTExtractor {
             fetch_stream.map(move |fetchreq: HistoryFetchReq| {
                 let client = fetch_client.clone();
                 async move {
-                    Ok(match fetchreq {
+                    BufferedOutput::Fetch(Ok(match fetchreq {
                         // It's OK to simply drop the refcounters in the event of fetch
                         // failure. We'll just proceed with shutdown.
                         HistoryFetchReq::Full(req, rc) => {
@@ -136,7 +165,7 @@ impl WFTExtractor {
                                 },
                             }
                         }
-                    })
+                    }))
                 }
                 .right_future()
             }),
@@ -144,5 +173,15 @@ impl WFTExtractor {
             |_: &mut ()| PollNext::Right,
         )
         .buffer_unordered(max_fetch_concurrency)
+        .map(move |output| match output {
+            BufferedOutput::WFT(output) => {
+                if pending_wft_outputs.fetch_sub(1, Ordering::AcqRel) == 1 {
+                    wft_output_delivered.notify_waiters();
+                }
+                output
+            }
+            BufferedOutput::Fetch(output) => output,
+            BufferedOutput::PollerDead => Ok(WFTExtractorOutput::PollerDead),
+        })
     }
 }

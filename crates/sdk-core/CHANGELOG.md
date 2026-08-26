@@ -54,6 +54,8 @@ relevant information.
   are preserved on failure; workers warn when the server does not advertise support.
 
 ### Fixed
+* Core now drains workflow tasks already received from the server before completing worker
+  shutdown.
 * The Prometheus exporter now appends `_total` to counter metric names when an SDK enables the
   counter suffix option.
 * An activity failure caused by oversized final heartbeat details is now counted in the
