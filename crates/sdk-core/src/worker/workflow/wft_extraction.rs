@@ -78,8 +78,9 @@ impl WFTExtractor {
         fetch_stream: impl Stream<Item = HistoryFetchReq> + Send + 'static,
     ) -> impl Stream<Item = Result<WFTExtractorOutput, tonic::Status>> + Send + 'static {
         let fetch_client = client.clone();
-        // The unordered buffer can otherwise deliver poller shutdown before workflow tasks that
-        // were already received, so gate shutdown on those task outputs reaching the consumer.
+        // Poller shutdown must wait for every earlier task to leave the unordered buffer. The
+        // workflow stream processes each yielded task synchronously before polling this stream
+        // again, so the shutdown marker cannot overtake a task after its counter is decremented.
         let pending_wft_outputs = Arc::new(AtomicUsize::new(0));
         let wft_output_delivered = Arc::new(Notify::new());
         let pending_wft_outputs_for_tasks = pending_wft_outputs.clone();
