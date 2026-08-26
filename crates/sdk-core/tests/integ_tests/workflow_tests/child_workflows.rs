@@ -266,17 +266,31 @@ async fn abandoned_child_resolves_post_cancel() {
         .await
         .unwrap();
     let client = starter.get_core_client().await;
-    let canceller = async {
+    // Wait for both executions explicitly because the default completion tracker only knows about
+    // the submitted parent, while this test intentionally abandons a child on the same worker.
+    worker.fetch_results = false;
+    let shutdown_handle = worker.inner_mut().shutdown_handle();
+    let completion_client = client.clone();
+    let completion_waiter = async {
         barr.wait().await;
         handle
             .cancel(WorkflowCancelOptions::builder().reason("die").build())
             .await
             .unwrap();
+        let child_handle = completion_client
+            .get_workflow_handle::<UntypedWorkflow>("abandoned-child-resolve-post-cancel");
+        let (parent_result, child_result) = join!(
+            handle.get_result(Default::default()),
+            child_handle.get_result(Default::default())
+        );
+        parent_result.unwrap();
+        child_result.unwrap();
+        shutdown_handle();
     };
     let runner = async move {
         worker.run_until_done().await.unwrap();
     };
-    tokio::join!(canceller, runner);
+    join!(completion_waiter, runner);
 
     // Verify no WFT failures on the child workflow. A failure here indicates
     // the child couldn't deserialize its input (e.g., sending a payload when none expected).
