@@ -28,7 +28,7 @@ use tracing::Span;
 pub(super) struct WFTExtractor {}
 
 pub(super) enum WFTExtractorOutput {
-    NewWFT(PermittedWFT),
+    NewWFT(PermittedWFT, PendingWFTOutput),
     FetchResult(
         PermittedWFT,
         // Field isn't read, but we need to hold on to it.
@@ -44,6 +44,7 @@ pub(super) enum WFTExtractorOutput {
         run_id: String,
         err: tonic::Status,
         auto_reply_fail_tt: Option<TaskToken>,
+        pending_wft_output: Option<PendingWFTOutput>,
     },
     PollerDead,
 }
@@ -70,6 +71,44 @@ pub(super) enum HistoryFetchReq {
 #[derive(Debug)]
 pub(super) struct HistfetchRC {}
 
+#[derive(Debug)]
+struct WFTOutputTracker {
+    pending: AtomicUsize,
+    consumed: Notify,
+}
+
+#[derive(Debug)]
+pub(super) struct PendingWFTOutput {
+    tracker: Option<Arc<WFTOutputTracker>>,
+}
+
+impl PendingWFTOutput {
+    fn new(tracker: Arc<WFTOutputTracker>) -> Self {
+        tracker.pending.fetch_add(1, Ordering::Relaxed);
+        Self {
+            tracker: Some(tracker),
+        }
+    }
+
+    pub(super) fn consumed(mut self) {
+        self.mark_consumed();
+    }
+
+    fn mark_consumed(&mut self) {
+        if let Some(tracker) = self.tracker.take()
+            && tracker.pending.fetch_sub(1, Ordering::AcqRel) == 1
+        {
+            tracker.consumed.notify_waiters();
+        }
+    }
+}
+
+impl Drop for PendingWFTOutput {
+    fn drop(&mut self) {
+        self.mark_consumed();
+    }
+}
+
 impl WFTExtractor {
     pub(super) fn build(
         client: Arc<dyn WorkerClient>,
@@ -78,17 +117,18 @@ impl WFTExtractor {
         fetch_stream: impl Stream<Item = HistoryFetchReq> + Send + 'static,
     ) -> impl Stream<Item = Result<WFTExtractorOutput, tonic::Status>> + Send + 'static {
         let fetch_client = client.clone();
-        // Poller shutdown must wait for every earlier task to leave the unordered buffer. The
-        // workflow stream processes each yielded task synchronously before polling this stream
-        // again, so the shutdown marker cannot overtake a task after its counter is decremented.
-        let pending_wft_outputs = Arc::new(AtomicUsize::new(0));
-        let wft_output_delivered = Arc::new(Notify::new());
-        let pending_wft_outputs_for_tasks = pending_wft_outputs.clone();
-        let pending_wft_outputs_for_shutdown = pending_wft_outputs.clone();
-        let wft_output_delivered_for_shutdown = wft_output_delivered.clone();
+        // Poller shutdown must not overtake a task that the extractor has received but the
+        // workflow stream has not yet incorporated into its state.
+        let wft_output_tracker = Arc::new(WFTOutputTracker {
+            pending: AtomicUsize::new(0),
+            consumed: Notify::new(),
+        });
+        let wft_output_tracker_for_tasks = wft_output_tracker.clone();
         let wft_stream = wft_stream
             .map(move |stream_in| {
-                pending_wft_outputs_for_tasks.fetch_add(1, Ordering::Relaxed);
+                let pending_wft_output = stream_in
+                    .is_ok()
+                    .then(|| PendingWFTOutput::new(wft_output_tracker_for_tasks.clone()));
                 let client = client.clone();
                 async move {
                     BufferedOutput::WFT(match stream_in {
@@ -96,18 +136,22 @@ impl WFTExtractor {
                             let run_id = wft.workflow_execution.run_id.clone();
                             let tt = wft.task_token.clone();
                             Ok(match HistoryPaginator::from_poll(wft, client).await {
-                                Ok((pag, prep)) => WFTExtractorOutput::NewWFT(PermittedWFT {
-                                    permit: permit.into_used(WorkflowSlotInfo {
-                                        workflow_type: prep.workflow_type.clone(),
-                                        is_sticky: prep.is_incremental(),
-                                    }),
-                                    work: prep,
-                                    paginator: pag,
-                                }),
+                                Ok((pag, prep)) => WFTExtractorOutput::NewWFT(
+                                    PermittedWFT {
+                                        permit: permit.into_used(WorkflowSlotInfo {
+                                            workflow_type: prep.workflow_type.clone(),
+                                            is_sticky: prep.is_incremental(),
+                                        }),
+                                        work: prep,
+                                        paginator: pag,
+                                    },
+                                    pending_wft_output.expect("successful poll has output tracker"),
+                                ),
                                 Err(err) => WFTExtractorOutput::FailedFetch {
                                     run_id,
                                     err,
                                     auto_reply_fail_tt: Some(tt),
+                                    pending_wft_output,
                                 },
                             })
                         }
@@ -119,11 +163,11 @@ impl WFTExtractor {
             })
             .chain(stream::iter([async move {
                 loop {
-                    let delivered = wft_output_delivered_for_shutdown.notified();
-                    if pending_wft_outputs_for_shutdown.load(Ordering::Acquire) == 0 {
+                    let consumed = wft_output_tracker.consumed.notified();
+                    if wft_output_tracker.pending.load(Ordering::Acquire) == 0 {
                         break;
                     }
-                    delivered.await;
+                    consumed.await;
                 }
                 BufferedOutput::PollerDead
             }
@@ -148,6 +192,7 @@ impl WFTExtractor {
                                     run_id,
                                     err,
                                     auto_reply_fail_tt: Some(task_token),
+                                    pending_wft_output: None,
                                 },
                             }
                         }
@@ -163,6 +208,7 @@ impl WFTExtractor {
                                     run_id: req.paginator.run_id,
                                     err,
                                     auto_reply_fail_tt: None,
+                                    pending_wft_output: None,
                                 },
                             }
                         }
@@ -174,13 +220,8 @@ impl WFTExtractor {
             |_: &mut ()| PollNext::Right,
         )
         .buffer_unordered(max_fetch_concurrency)
-        .map(move |output| match output {
-            BufferedOutput::WFT(output) => {
-                if pending_wft_outputs.fetch_sub(1, Ordering::AcqRel) == 1 {
-                    wft_output_delivered.notify_waiters();
-                }
-                output
-            }
+        .map(|output| match output {
+            BufferedOutput::WFT(output) => output,
             BufferedOutput::Fetch(output) => output,
             BufferedOutput::PollerDead => Ok(WFTExtractorOutput::PollerDead),
         })

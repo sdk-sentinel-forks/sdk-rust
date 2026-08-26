@@ -4,7 +4,7 @@ use crate::{
     worker::workflow::{
         managed_run::RunUpdateAct,
         run_cache::RunCache,
-        wft_extraction::{HistfetchRC, HistoryFetchReq, WFTExtractorOutput},
+        wft_extraction::{HistfetchRC, HistoryFetchReq, PendingWFTOutput, WFTExtractorOutput},
         *,
     },
 };
@@ -108,9 +108,13 @@ impl WFStream {
                 let mut activations = vec![];
                 let mut actions = vec![];
                 let maybe_act = match action {
-                    WFStreamInput::NewWft(pwft) => {
+                    WFStreamInput::NewWft(pwft, pending_wft_output) => {
                         debug!(run_id=%pwft.work.execution.run_id, "New WFT");
-                        state.instantiate_or_update(*pwft)
+                        let action = state.instantiate_or_update(*pwft);
+                        if let Some(pending_wft_output) = pending_wft_output {
+                            pending_wft_output.consumed();
+                        }
+                        action
                     }
                     WFStreamInput::Local(local_input) => {
                         let _span_g = local_input.span.enter();
@@ -160,9 +164,10 @@ impl WFStream {
                         run_id,
                         err,
                         auto_reply_fail_tt,
+                        pending_wft_output,
                     } => {
                         let message = format!("Fetching history failed: {err:?}");
-                        if !state.runs.has_run(&run_id)
+                        let action = if !state.runs.has_run(&run_id)
                             && let Some(task_token) = auto_reply_fail_tt.clone()
                         {
                             actions.push(WorkflowStreamAction::FailUnstoredWft {
@@ -181,7 +186,11 @@ impl WFStream {
                                     auto_reply_fail_tt,
                                 })
                                 .into_run_update_resp()
+                        };
+                        if let Some(pending_wft_output) = pending_wft_output {
+                            pending_wft_output.consumed();
                         }
+                        action
                     }
                     WFStreamInput::PollerDead => {
                         debug!("WFT poller died, beginning shutdown");
@@ -623,7 +632,7 @@ impl WFStream {
 /// All possible inputs to the [WFStream]
 #[derive(derive_more::From, Debug)]
 enum WFStreamInput {
-    NewWft(Box<PermittedWFT>),
+    NewWft(Box<PermittedWFT>, Option<PendingWFTOutput>),
     Local(Box<LocalInput>),
     /// The stream given to us which represents the poller (or a mock) terminated.
     PollerDead,
@@ -634,6 +643,7 @@ enum WFStreamInput {
         run_id: String,
         err: tonic::Status,
         auto_reply_fail_tt: Option<TaskToken>,
+        pending_wft_output: Option<PendingWFTOutput>,
     },
 }
 impl From<LocalInput> for WFStreamInput {
@@ -689,7 +699,7 @@ impl LocalInputs {
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)] // PollerDead only ever gets used once, so not important.
 enum ExternalPollerInputs {
-    NewWft(PermittedWFT),
+    NewWft(PermittedWFT, PendingWFTOutput),
     PollerDead,
     PollerError(tonic::Status),
     FetchedUpdate(PermittedWFT),
@@ -702,23 +712,28 @@ enum ExternalPollerInputs {
         run_id: String,
         err: tonic::Status,
         auto_reply_fail_tt: Option<TaskToken>,
+        pending_wft_output: Option<PendingWFTOutput>,
     },
 }
 impl From<ExternalPollerInputs> for WFStreamInput {
     fn from(l: ExternalPollerInputs) -> Self {
         match l {
-            ExternalPollerInputs::NewWft(v) => WFStreamInput::NewWft(Box::new(v)),
+            ExternalPollerInputs::NewWft(v, pending) => {
+                WFStreamInput::NewWft(Box::new(v), Some(pending))
+            }
             ExternalPollerInputs::PollerDead => WFStreamInput::PollerDead,
             ExternalPollerInputs::PollerError(e) => WFStreamInput::PollerError(e),
-            ExternalPollerInputs::FetchedUpdate(wft) => WFStreamInput::NewWft(Box::new(wft)),
+            ExternalPollerInputs::FetchedUpdate(wft) => WFStreamInput::NewWft(Box::new(wft), None),
             ExternalPollerInputs::FailedFetch {
                 run_id,
                 err,
                 auto_reply_fail_tt,
+                pending_wft_output,
             } => WFStreamInput::FailedFetch {
                 run_id,
                 err,
                 auto_reply_fail_tt,
+                pending_wft_output,
             },
             ExternalPollerInputs::NextPage {
                 paginator,
@@ -734,7 +749,9 @@ impl From<ExternalPollerInputs> for WFStreamInput {
 impl From<Result<WFTExtractorOutput, tonic::Status>> for ExternalPollerInputs {
     fn from(v: Result<WFTExtractorOutput, tonic::Status>) -> Self {
         match v {
-            Ok(WFTExtractorOutput::NewWFT(pwft)) => ExternalPollerInputs::NewWft(pwft),
+            Ok(WFTExtractorOutput::NewWFT(pwft, pending)) => {
+                ExternalPollerInputs::NewWft(pwft, pending)
+            }
             Ok(WFTExtractorOutput::FetchResult(updated_wft, _)) => {
                 ExternalPollerInputs::FetchedUpdate(updated_wft)
             }
@@ -752,10 +769,12 @@ impl From<Result<WFTExtractorOutput, tonic::Status>> for ExternalPollerInputs {
                 run_id,
                 err,
                 auto_reply_fail_tt,
+                pending_wft_output,
             }) => ExternalPollerInputs::FailedFetch {
                 run_id,
                 err,
                 auto_reply_fail_tt,
+                pending_wft_output,
             },
             Ok(WFTExtractorOutput::PollerDead) => ExternalPollerInputs::PollerDead,
             Err(e) => ExternalPollerInputs::PollerError(e),
