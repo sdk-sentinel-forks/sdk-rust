@@ -93,6 +93,11 @@ relevant information.
   was counted under the reason for the failure the activity itself reported, and was not counted at
   all when that failure was benign, even though the worker reported a payload-limit failure to the
   server.
+* Workers configured with a small `max_cached_workflows` no longer briefly stop accepting new
+  workflows. Sticky workflow-task pollers could consume every workflow-cache permit and starve the
+  non-sticky poller, so the worker would stop picking up new workflows until a poll timed out (up to
+  ~60s). The poll balancer now reserves a non-sticky slot against the cache size rather than the
+  slot-supplier size.
 
 ## [0.7.0] - 2026-08-17
 

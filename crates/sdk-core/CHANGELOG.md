@@ -97,3 +97,8 @@ relevant information.
   already elapsed, a sub-millisecond unit, or a multi-unit value like `1m30s`. Previously such a
   header was ignored entirely, so the handler was never told the task had timed out, and a task
   left unanswered could block worker shutdown indefinitely.
+* Workers with a small workflow cache no longer briefly stop accepting new workflows. Sticky
+  workflow-task pollers could consume every workflow-cache permit and starve the non-sticky poller,
+  so the worker would stop picking up new workflows until a poll timed out (up to ~60s). The poll
+  balancer now reserves a non-sticky slot against the workflow cache size rather than the slot
+  supplier size.
