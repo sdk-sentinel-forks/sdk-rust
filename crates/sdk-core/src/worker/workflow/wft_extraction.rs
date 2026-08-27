@@ -1,5 +1,5 @@
 use crate::{
-    abstractions::OwnedMeteredSemPermit,
+    abstractions::{ActiveCounter, OwnedMeteredSemPermit},
     protosext::ValidPollWFTQResponse,
     worker::{
         WorkflowSlotKind,
@@ -15,12 +15,9 @@ use futures_util::{
     future::BoxFuture,
     stream::{self, PollNext},
 };
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
+use std::sync::Arc;
 use temporalio_common::protos::{TaskToken, coresdk::WorkflowSlotInfo};
-use tokio::sync::Notify;
+use tokio::sync::watch;
 use tracing::Span;
 
 /// Transforms incoming validated WFTs and history fetching requests into [PermittedWFT]s ready
@@ -71,31 +68,7 @@ pub(super) enum HistoryFetchReq {
 #[derive(Debug)]
 pub(super) struct HistfetchRC {}
 
-#[derive(Debug)]
-struct WFTOutputTracker {
-    pending: AtomicUsize,
-    consumed: Notify,
-}
-
-#[derive(Debug)]
-pub(super) struct PendingWFTOutput {
-    tracker: Arc<WFTOutputTracker>,
-}
-
-impl PendingWFTOutput {
-    fn new(tracker: Arc<WFTOutputTracker>) -> Self {
-        tracker.pending.fetch_add(1, Ordering::Relaxed);
-        Self { tracker }
-    }
-}
-
-impl Drop for PendingWFTOutput {
-    fn drop(&mut self) {
-        if self.tracker.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.tracker.consumed.notify_waiters();
-        }
-    }
-}
+pub(super) type PendingWFTOutput = ActiveCounter<fn(usize)>;
 
 impl WFTExtractor {
     pub(super) fn build(
@@ -107,15 +80,10 @@ impl WFTExtractor {
         let fetch_client = client.clone();
         // Poller shutdown must not overtake a task that the extractor has received but the
         // workflow stream has not yet incorporated into its state.
-        let wft_output_tracker = Arc::new(WFTOutputTracker {
-            pending: AtomicUsize::new(0),
-            consumed: Notify::new(),
-        });
-        let wft_output_tracker_for_tasks = wft_output_tracker.clone();
+        let (pending_wft_outputs_tx, mut pending_wft_outputs_rx) = watch::channel(0);
         let wft_stream = wft_stream
             .map(move |stream_in| {
-                let pending_wft_output =
-                    PendingWFTOutput::new(wft_output_tracker_for_tasks.clone());
+                let pending_wft_output = ActiveCounter::new(pending_wft_outputs_tx.clone(), None);
                 let client = client.clone();
                 async move {
                     BufferedOutput::WFT(match stream_in {
@@ -149,13 +117,10 @@ impl WFTExtractor {
                 .left_future()
             })
             .chain(stream::iter([async move {
-                loop {
-                    let consumed = wft_output_tracker.consumed.notified();
-                    if wft_output_tracker.pending.load(Ordering::Acquire) == 0 {
-                        break;
-                    }
-                    consumed.await;
-                }
+                pending_wft_outputs_rx
+                    .wait_for(|pending| *pending == 0)
+                    .await
+                    .expect("pending WFT output senders live until all outputs are consumed");
                 BufferedOutput::PollerDead
             }
             .boxed()
