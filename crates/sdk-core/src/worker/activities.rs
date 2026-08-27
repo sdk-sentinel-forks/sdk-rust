@@ -9,8 +9,8 @@ pub(crate) use local_activities::{
 use crate::{
     TaskToken,
     abstractions::{
-        ClosableMeteredPermitDealer, MeteredPermitDealer, TrackedOwnedMeteredSemPermit,
-        UsedMeteredSemPermit,
+        ActiveCounter, ClosableMeteredPermitDealer, MeteredPermitDealer,
+        TrackedOwnedMeteredSemPermit, UsedMeteredSemPermit,
     },
     pollers::{BoxedActPoller, PermittedTqResp, TrackedPermittedTqResp, new_activity_task_poller},
     telemetry::metrics::{
@@ -66,6 +66,7 @@ use tokio::{
     sync::{
         Mutex, Notify,
         mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+        watch,
     },
     task::JoinHandle,
 };
@@ -183,8 +184,13 @@ pub(crate) struct WorkerActivityTasks {
     max_heartbeat_throttle_interval: Duration,
     default_heartbeat_throttle_interval: Duration,
 
-    /// Wakes every time an activity is removed from the outstanding map
-    complete_notify: Arc<Notify>,
+    /// Counts completions which have already taken their task out of
+    /// `outstanding_activity_tasks` but are still flushing the result to server. Such a
+    /// completion still owns the activity's slot permit, so shutdown must not treat the empty
+    /// map as "all activities finished" while this is nonzero — otherwise the heartbeat manager
+    /// can be torn down out from under an in-flight eviction (stranding it forever) and worker
+    /// shutdown can proceed while the result was never reported.
+    completions_in_flight: watch::Sender<usize>,
     /// Token to notify when poll returned a shutdown error
     poll_returned_shutdown_token: CancellationToken,
     /// Used to inject external cancellations (e.g. from nexus worker commands)
@@ -226,7 +232,7 @@ impl WorkerActivityTasks {
         let (cancels_tx, cancels_rx) = unbounded_channel();
         let external_cancels_tx = cancels_tx.clone();
         let heartbeat_manager = ActivityHeartbeatManager::new(client, cancels_tx.clone());
-        let complete_notify = Arc::new(Notify::new());
+        let (completions_in_flight, completions_in_flight_rx) = watch::channel(0);
         let source_stream = stream::select_with_strategy(
             UnboundedReceiverStream::new(cancels_rx).map(ActivityTaskSource::from),
             starts_stream.map(|a| ActivityTaskSource::from(Box::new(a))),
@@ -237,7 +243,7 @@ impl WorkerActivityTasks {
             source_stream,
             outstanding_tasks: outstanding_activity_tasks.clone(),
             start_tasks_stream_complete,
-            complete_notify: complete_notify.clone(),
+            completions_in_flight: completions_in_flight_rx,
             grace_period: graceful_shutdown,
             cancels_tx,
             local_timeout_buffer,
@@ -252,7 +258,7 @@ impl WorkerActivityTasks {
             heartbeat_manager,
             activity_task_stream: Mutex::new(activity_task_stream.boxed()),
             eager_activities_semaphore,
-            complete_notify,
+            completions_in_flight,
             metrics,
             max_heartbeat_throttle_interval,
             default_heartbeat_throttle_interval,
@@ -341,6 +347,12 @@ impl WorkerActivityTasks {
         status: aer::Status,
         client: &dyn WorkerClient,
     ) {
+        // Counted before taking the task out of the outstanding map so shutdown can never
+        // observe the map empty without also seeing this completion in flight. Declared first so
+        // it drops after `act_info` — and thus after the slot permit — even if this future is
+        // cancelled or panics mid-completion.
+        let _completion_guard =
+            ActiveCounter::<fn(usize)>::new(self.completions_in_flight.clone(), None);
         let act_info = {
             let mut outstanding_activity_tasks = self.outstanding_activity_tasks.lock();
             outstanding_activity_tasks.remove(&task_token)
@@ -556,8 +568,6 @@ impl WorkerActivityTasks {
                 &task_token
             );
         }
-
-        self.complete_notify.notify_waiters();
     }
 
     /// Attempt to record an activity heartbeat
@@ -636,7 +646,7 @@ struct ActivityTaskStream<SrcStrm> {
     source_stream: SrcStrm,
     outstanding_tasks: OutstandingActMap,
     start_tasks_stream_complete: CancellationToken,
-    complete_notify: Arc<Notify>,
+    completions_in_flight: watch::Receiver<usize>,
     grace_period: Option<Duration>,
     cancels_tx: UnboundedSender<PendingActivityCancel>,
     /// The extra time we'll wait for local timeouts before firing them, to avoid racing with server
@@ -815,11 +825,23 @@ where
                 join!(
                     async {
                         self.start_tasks_stream_complete.cancelled().await;
-                        while {
-                            let outstanding_tasks = outstanding_tasks_clone.lock();
-                            !outstanding_tasks.is_empty()
-                        } {
-                            self.complete_notify.notified().await
+                        let mut completions_in_flight = self.completions_in_flight;
+                        loop {
+                            let no_outstanding = outstanding_tasks_clone.lock().is_empty();
+                            // An empty map alone isn't "all activities finished": completions
+                            // flushing to server have already left the map but still hold their
+                            // slot permit, and still need the heartbeat manager alive. Tasks only
+                            // ever leave the map inside a counted completion, so every relevant
+                            // transition ends in a counter change and waiting on the counter
+                            // alone can't miss one.
+                            if no_outstanding && *completions_in_flight.borrow_and_update() == 0 {
+                                break;
+                            }
+                            if completions_in_flight.changed().await.is_err() {
+                                // Sender closed: the manager (and any completion guards, which
+                                // hold sender clones) are gone, so nothing further can flush.
+                                break;
+                            }
                         }
                         // If we were waiting for the grace period but everything already finished,
                         // we don't need to keep waiting.

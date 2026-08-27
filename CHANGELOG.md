@@ -85,6 +85,12 @@ relevant information.
   `WorkflowStartOptions::start_signal` and `WorkflowStartSignal`.
 
 ### Fixed
+* `Worker` shutdown no longer loses an activity result it was still reporting to the server. If
+  shutdown raced such a completion — most likely while the activity's final heartbeat RPC was
+  still in flight — the worker could strand the completion forever: debug builds panicked with
+  `Waiting for all slot permits to release took too long!`, and release builds logged that error
+  and dropped the result, leaving the server to time the activity out before retrying it.
+  Shutdown now drains in-flight completions first.
 * The Prometheus exporter now respects `PrometheusExporterOptions::counters_total_suffix`,
   appending `_total` to counter metric names when enabled.
 * Workflow start requests now include the client's identity.
