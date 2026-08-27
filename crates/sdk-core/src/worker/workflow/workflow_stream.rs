@@ -108,13 +108,9 @@ impl WFStream {
                 let mut activations = vec![];
                 let mut actions = vec![];
                 let maybe_act = match action {
-                    WFStreamInput::NewWft(pwft, pending_wft_output) => {
+                    WFStreamInput::NewWft(pwft, _pending_wft_output) => {
                         debug!(run_id=%pwft.work.execution.run_id, "New WFT");
-                        let action = state.instantiate_or_update(*pwft);
-                        if let Some(pending_wft_output) = pending_wft_output {
-                            pending_wft_output.consumed();
-                        }
-                        action
+                        state.instantiate_or_update(*pwft)
                     }
                     WFStreamInput::Local(local_input) => {
                         let _span_g = local_input.span.enter();
@@ -164,10 +160,10 @@ impl WFStream {
                         run_id,
                         err,
                         auto_reply_fail_tt,
-                        pending_wft_output,
+                        pending_wft_output: _pending_wft_output,
                     } => {
                         let message = format!("Fetching history failed: {err:?}");
-                        let action = if !state.runs.has_run(&run_id)
+                        if !state.runs.has_run(&run_id)
                             && let Some(task_token) = auto_reply_fail_tt.clone()
                         {
                             actions.push(WorkflowStreamAction::FailUnstoredWft {
@@ -186,11 +182,7 @@ impl WFStream {
                                     auto_reply_fail_tt,
                                 })
                                 .into_run_update_resp()
-                        };
-                        if let Some(pending_wft_output) = pending_wft_output {
-                            pending_wft_output.consumed();
                         }
-                        action
                     }
                     WFStreamInput::PollerDead => {
                         debug!("WFT poller died, beginning shutdown");

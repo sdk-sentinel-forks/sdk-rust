@@ -79,33 +79,21 @@ struct WFTOutputTracker {
 
 #[derive(Debug)]
 pub(super) struct PendingWFTOutput {
-    tracker: Option<Arc<WFTOutputTracker>>,
+    tracker: Arc<WFTOutputTracker>,
 }
 
 impl PendingWFTOutput {
     fn new(tracker: Arc<WFTOutputTracker>) -> Self {
         tracker.pending.fetch_add(1, Ordering::Relaxed);
-        Self {
-            tracker: Some(tracker),
-        }
-    }
-
-    pub(super) fn consumed(mut self) {
-        self.mark_consumed();
-    }
-
-    fn mark_consumed(&mut self) {
-        if let Some(tracker) = self.tracker.take()
-            && tracker.pending.fetch_sub(1, Ordering::AcqRel) == 1
-        {
-            tracker.consumed.notify_waiters();
-        }
+        Self { tracker }
     }
 }
 
 impl Drop for PendingWFTOutput {
     fn drop(&mut self) {
-        self.mark_consumed();
+        if self.tracker.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.tracker.consumed.notify_waiters();
+        }
     }
 }
 
@@ -126,9 +114,8 @@ impl WFTExtractor {
         let wft_output_tracker_for_tasks = wft_output_tracker.clone();
         let wft_stream = wft_stream
             .map(move |stream_in| {
-                let pending_wft_output = stream_in
-                    .is_ok()
-                    .then(|| PendingWFTOutput::new(wft_output_tracker_for_tasks.clone()));
+                let pending_wft_output =
+                    PendingWFTOutput::new(wft_output_tracker_for_tasks.clone());
                 let client = client.clone();
                 async move {
                     BufferedOutput::WFT(match stream_in {
@@ -145,13 +132,13 @@ impl WFTExtractor {
                                         work: prep,
                                         paginator: pag,
                                     },
-                                    pending_wft_output.expect("successful poll has output tracker"),
+                                    pending_wft_output,
                                 ),
                                 Err(err) => WFTExtractorOutput::FailedFetch {
                                     run_id,
                                     err,
                                     auto_reply_fail_tt: Some(tt),
-                                    pending_wft_output,
+                                    pending_wft_output: Some(pending_wft_output),
                                 },
                             })
                         }
