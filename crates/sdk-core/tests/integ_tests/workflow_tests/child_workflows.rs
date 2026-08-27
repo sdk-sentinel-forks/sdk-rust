@@ -34,7 +34,8 @@ use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
     ApplicationFailure, CancellableFuture, ChildWorkflowCancellationType,
     ChildWorkflowExecutionError, ChildWorkflowOptions, ChildWorkflowStartError, ParentClosePolicy,
-    SyncWorkflowContext, WorkflowContext, WorkflowResult, WorkflowSignalError, WorkflowTermination,
+    SyncWorkflowContext, TimerOptions, WorkflowCancellationToken, WorkflowContext, WorkflowResult,
+    WorkflowSignalError, WorkflowTermination,
 };
 use temporalio_sdk_core::{
     replay::{DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder, canned_histories},
@@ -205,6 +206,7 @@ struct AbandonedChildResolvesPostCancelParent {
 impl AbandonedChildResolvesPostCancelParent {
     #[run(name = "parent_wf")]
     async fn run(ctx: &mut WorkflowContext<Self>) -> WorkflowResult<()> {
+        let post_cancel_token = WorkflowCancellationToken::new();
         let started = ctx
             .start_child_workflow(
                 AbandonedChildResolvesPostCancelChild::run,
@@ -213,6 +215,7 @@ impl AbandonedChildResolvesPostCancelParent {
                     .workflow_id("abandoned-child-resolve-post-cancel".to_owned())
                     .parent_close_policy(ParentClosePolicy::Abandon)
                     .cancel_type(ChildWorkflowCancellationType::Abandon)
+                    .cancellation_token(post_cancel_token.clone())
                     .build(),
             )
             .await
@@ -221,7 +224,12 @@ impl AbandonedChildResolvesPostCancelParent {
         barr.wait().await;
         ctx.cancelled().await;
         started.cancel("Die reason".to_string());
-        ctx.timer(Duration::from_secs(1)).await;
+        ctx.timer(
+            TimerOptions::builder(Duration::from_secs(1))
+                .cancellation_token(post_cancel_token)
+                .build(),
+        )
+        .await;
         let _ = started.result().await;
         Ok(())
     }
@@ -277,6 +285,7 @@ async fn abandoned_child_resolves_post_cancel() {
         worker.run_until_done().await.unwrap();
     };
     tokio::join!(canceller, runner);
+    handle.get_result(Default::default()).await.unwrap();
 
     // Verify no WFT failures on the child workflow. A failure here indicates
     // the child couldn't deserialize its input (e.g., sending a payload when none expected).

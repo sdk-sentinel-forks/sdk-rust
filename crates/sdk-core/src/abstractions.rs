@@ -437,7 +437,6 @@ macro_rules! dbg_panic {
 }
 pub(crate) use dbg_panic;
 
-#[derive(Debug)]
 pub(crate) struct ActiveCounter<F: Fn(usize)>(watch::Sender<usize>, Option<Arc<F>>);
 impl<F> ActiveCounter<F>
 where

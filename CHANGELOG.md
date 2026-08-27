@@ -61,7 +61,6 @@ relevant information.
   `WorkflowStartOptions::start_signal` and `WorkflowStartSignal`.
 
 ### Fixed
-* Workers no longer risk dropping workflow tasks received just before shutdown.
 * The Prometheus exporter now respects `PrometheusExporterOptions::counters_total_suffix`,
   appending `_total` to counter metric names when enabled.
 * An activity failure caused by oversized final heartbeat details is now counted in the
