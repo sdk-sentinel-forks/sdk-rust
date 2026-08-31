@@ -2,16 +2,20 @@
 //! serialization related functionality.
 
 mod failure_converter;
+mod well_known;
 
 pub use failure_converter::{
     ActivityExecutionDecodeHint, ChildWorkflowExecutionDecodeHint, ChildWorkflowStartDecodeHint,
     DefaultFailureConverter, FailureConverter, FailureDecodeHint, NoopDecodeHint,
     WorkflowSignalDecodeHint,
 };
+use well_known::{BINARY_NULL_ENCODING_VAL, WellKnownType, binary_null_payload};
 
-use crate::protos::temporal::api::common::v1::Payload;
+use crate::protos::{ENCODING_PAYLOAD_KEY, JSON_ENCODING_VAL, temporal::api::common::v1::Payload};
 use futures::{FutureExt, future::BoxFuture};
 use std::{collections::HashMap, sync::Arc};
+
+const PROTOBUF_ENCODING_VAL: &str = "binary/protobuf";
 
 /// Combines a [`PayloadConverter`], [`FailureConverter`], and [`PayloadCodec`] to handle all
 /// serialization needs for communicating with the Temporal server.
@@ -486,23 +490,55 @@ impl GenericPayloadConverter for PayloadConverter {
         context: &SerializationContext<'_>,
         val: &T,
     ) -> Result<Payload, PayloadConversionError> {
-        // If a single payload is explicitly needed for `()`, then produce a null payload
-        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<()>() {
-            return Ok(binary_null_payload());
+        match self {
+            PayloadConverter::Serde(pc) => {
+                if let Some(well_known_type) = WellKnownType::of::<T>() {
+                    Ok(well_known_type.to_payload(val))
+                } else {
+                    pc.to_payload(context.data, val.as_serde()?)
+                }
+            }
+            PayloadConverter::UseWrappers => T::to_payload(val, context),
+            PayloadConverter::Composite(composite) => {
+                for converter in &composite.converters {
+                    match converter.to_payload(context, val) {
+                        Ok(payload) => return Ok(payload),
+                        Err(PayloadConversionError::WrongEncoding) => continue,
+                        Err(e) => return Err(e),
+                    }
+                }
+                Err(PayloadConversionError::WrongEncoding)
+            }
         }
-        let mut payloads = self.to_payloads(context, val)?;
-        if payloads.len() != 1 {
-            return Err(PayloadConversionError::WrongEncoding);
-        }
-        Ok(payloads.pop().unwrap())
     }
 
     fn from_payload<T: TemporalDeserializable + 'static>(
         &self,
         context: &SerializationContext<'_>,
-        payload: Payload,
+        mut payload: Payload,
     ) -> Result<T, PayloadConversionError> {
-        self.from_payloads(context, vec![payload])
+        match self {
+            PayloadConverter::Serde(pc) => {
+                if let Some(well_known_type) = WellKnownType::of::<T>() {
+                    payload = match well_known_type.try_from_payload(payload) {
+                        Ok(value) => return Ok(value),
+                        Err(payload) => payload,
+                    };
+                }
+                T::from_serde(pc.as_ref(), context, payload)
+            }
+            PayloadConverter::UseWrappers => T::from_payload(context, payload),
+            PayloadConverter::Composite(composite) => {
+                for converter in &composite.converters {
+                    match converter.from_payload(context, payload.clone()) {
+                        Ok(value) => return Ok(value),
+                        Err(PayloadConversionError::WrongEncoding) => continue,
+                        Err(e) => return Err(e),
+                    }
+                }
+                Err(PayloadConversionError::WrongEncoding)
+            }
+        }
     }
 
     fn to_payloads<T: TemporalSerializable + 'static>(
@@ -512,19 +548,8 @@ impl GenericPayloadConverter for PayloadConverter {
     ) -> Result<Vec<Payload>, PayloadConversionError> {
         match self {
             PayloadConverter::Serde(pc) => {
-                // Since Rust SDK uses () to denote no input, we must match other SDKs by producing
-                // no payloads for it.
-                if std::any::TypeId::of::<T>() == std::any::TypeId::of::<()>() {
-                    Ok(Vec::new())
-                } else if let Some(bytes) = (val as &dyn std::any::Any).downcast_ref::<Vec<u8>>() {
-                    Ok(vec![binary_plain_payload(bytes.clone())])
-                } else if let Some(bytes) =
-                    (val as &dyn std::any::Any).downcast_ref::<Option<Vec<u8>>>()
-                {
-                    Ok(vec![match bytes {
-                        Some(bytes) => binary_plain_payload(bytes.clone()),
-                        None => binary_null_payload(),
-                    }])
+                if let Some(well_known_type) = WellKnownType::of::<T>() {
+                    Ok(well_known_type.to_payloads(val))
                 } else {
                     Ok(vec![pc.to_payload(context.data, val.as_serde()?)?])
                 }
@@ -546,39 +571,20 @@ impl GenericPayloadConverter for PayloadConverter {
     fn from_payloads<T: TemporalDeserializable + 'static>(
         &self,
         context: &SerializationContext<'_>,
-        payloads: Vec<Payload>,
+        mut payloads: Vec<Payload>,
     ) -> Result<T, PayloadConversionError> {
-        // Accept empty payloads (no args) and a single binary/null payload (result from a
-        // workflow/update with () return type as ().
-        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<()>()
-            && is_unit_payloads(&payloads)
-        {
-            let boxed: Box<dyn std::any::Any> = Box::new(());
-            return Ok(*boxed.downcast::<T>().unwrap());
-        }
-
         match self {
             PayloadConverter::Serde(pc) => {
+                if let Some(well_known_type) = WellKnownType::of::<T>() {
+                    payloads = match well_known_type.try_from_payloads(payloads) {
+                        Ok(value) => return Ok(value),
+                        Err(payloads) => payloads,
+                    };
+                }
                 if payloads.len() != 1 {
                     return Err(PayloadConversionError::WrongEncoding);
                 }
                 let payload = payloads.into_iter().next().unwrap();
-                if std::any::TypeId::of::<T>() == std::any::TypeId::of::<Vec<u8>>()
-                    && is_binary_plain_payload(&payload)
-                {
-                    let boxed: Box<dyn std::any::Any> = Box::new(payload.data);
-                    return Ok(*boxed.downcast::<T>().unwrap());
-                }
-                if std::any::TypeId::of::<T>() == std::any::TypeId::of::<Option<Vec<u8>>>() {
-                    if is_binary_plain_payload(&payload) {
-                        let boxed: Box<dyn std::any::Any> = Box::new(Some(payload.data));
-                        return Ok(*boxed.downcast::<T>().unwrap());
-                    }
-                    if is_binary_null_payload(&payload) {
-                        let boxed: Box<dyn std::any::Any> = Box::new(None::<Vec<u8>>);
-                        return Ok(*boxed.downcast::<T>().unwrap());
-                    }
-                }
                 T::from_serde(pc.as_ref(), context, payload)
             }
             PayloadConverter::UseWrappers => T::from_payloads(context, payloads),
@@ -593,50 +599,6 @@ impl GenericPayloadConverter for PayloadConverter {
                 Err(PayloadConversionError::WrongEncoding)
             }
         }
-    }
-}
-
-fn binary_plain_payload(data: Vec<u8>) -> Payload {
-    Payload {
-        metadata: HashMap::from([("encoding".to_string(), b"binary/plain".to_vec())]),
-        data,
-        external_payloads: vec![],
-    }
-}
-
-fn is_binary_plain_payload(payload: &Payload) -> bool {
-    payload
-        .metadata
-        .get("encoding")
-        .is_some_and(|encoding| encoding == b"binary/plain")
-}
-
-fn binary_null_payload() -> Payload {
-    Payload {
-        metadata: {
-            let mut hm = HashMap::new();
-            hm.insert("encoding".to_string(), b"binary/null".to_vec());
-            hm
-        },
-        data: vec![],
-        external_payloads: vec![],
-    }
-}
-
-fn is_binary_null_payload(payload: &Payload) -> bool {
-    payload.data.is_empty()
-        && payload
-            .metadata
-            .get("encoding")
-            .map(|encoding| encoding == b"binary/null")
-            .unwrap_or(false)
-}
-
-fn is_unit_payloads(payloads: &[Payload]) -> bool {
-    match payloads {
-        [] => true,
-        [payload] => is_binary_null_payload(payload),
-        _ => false,
     }
 }
 
@@ -682,7 +644,10 @@ impl ErasedSerdePayloadConverter for SerdeJsonPayloadConverter {
         Ok(Payload {
             metadata: {
                 let mut hm = HashMap::new();
-                hm.insert("encoding".to_string(), b"json/plain".to_vec());
+                hm.insert(
+                    ENCODING_PAYLOAD_KEY.to_string(),
+                    JSON_ENCODING_VAL.as_bytes().to_vec(),
+                );
                 hm
             },
             data: as_json,
@@ -695,11 +660,14 @@ impl ErasedSerdePayloadConverter for SerdeJsonPayloadConverter {
         _: &SerializationContextData,
         payload: Payload,
     ) -> Result<Box<dyn erased_serde::Deserializer<'static>>, PayloadConversionError> {
-        let encoding = payload.metadata.get("encoding").map(|v| v.as_slice());
-        let json_v = if encoding == Some(b"json/plain".as_slice()) {
+        let encoding = payload
+            .metadata
+            .get(ENCODING_PAYLOAD_KEY)
+            .map(|v| v.as_slice());
+        let json_v = if encoding == Some(JSON_ENCODING_VAL.as_bytes()) {
             serde_json::from_slice(&payload.data)
                 .map_err(|e| PayloadConversionError::EncodingError(Box::new(e)))?
-        } else if encoding == Some(b"binary/null".as_slice()) {
+        } else if encoding == Some(BINARY_NULL_ENCODING_VAL.as_bytes()) {
             serde_json::Value::Null
         } else {
             return Err(PayloadConversionError::WrongEncoding);
@@ -738,7 +706,10 @@ where
         Ok(Payload {
             metadata: {
                 let mut hm = HashMap::new();
-                hm.insert("encoding".to_string(), b"binary/protobuf".to_vec());
+                hm.insert(
+                    ENCODING_PAYLOAD_KEY.to_string(),
+                    PROTOBUF_ENCODING_VAL.as_bytes().to_vec(),
+                );
                 hm
             },
             data: as_proto,
@@ -757,8 +728,8 @@ where
     where
         Self: Sized,
     {
-        let encoding = p.metadata.get("encoding").map(|v| v.as_slice());
-        if encoding != Some(b"binary/protobuf".as_slice()) {
+        let encoding = p.metadata.get(ENCODING_PAYLOAD_KEY).map(|v| v.as_slice());
+        if encoding != Some(PROTOBUF_ENCODING_VAL.as_bytes()) {
             return Err(PayloadConversionError::WrongEncoding);
         }
         T::decode(p.data.as_slice())
@@ -861,20 +832,11 @@ impl_multi_args!(MultiArgs6; 6; 0: A, 1: B, 2: C, 3: D, 4: E, 5: F);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data_converters::well_known::BINARY_PLAIN_ENCODING_VAL;
+    use rstest::rstest;
 
     #[test]
-    fn test_empty_payloads_as_unit_type() {
-        let converter = PayloadConverter::default();
-        let ctx = SerializationContext::new(&SerializationContextData::Workflow, &converter);
-
-        let empty_payloads: Vec<Payload> = vec![];
-        let result: Result<(), _> = converter.from_payloads(&ctx, empty_payloads);
-
-        assert!(result.is_ok(), "Empty payloads should deserialize as ()");
-    }
-
-    #[test]
-    fn test_unit_type_roundtrip_serde() {
+    fn unit_payloads_roundtrip() {
         let converter = PayloadConverter::serde_json();
         let ctx = SerializationContext::new(&SerializationContextData::Workflow, &converter);
 
@@ -885,35 +847,91 @@ mod tests {
         assert_eq!(result, ());
     }
 
-    #[test]
-    fn test_unit_composite_roundtrip() {
+    #[rstest]
+    #[case::unit((), BINARY_NULL_ENCODING_VAL, b"")]
+    #[case::none_string(Option::<String>::None, BINARY_NULL_ENCODING_VAL, b"")]
+    #[case::some_string(
+        Some("value".to_string()),
+        JSON_ENCODING_VAL,
+        br#""value""#
+    )]
+    #[case::bytes(vec![0_u8, 1, 2, 255], BINARY_PLAIN_ENCODING_VAL, &[0, 1, 2, 255])]
+    #[case::some_bytes(
+        Some(vec![1_u8, 2, 3]),
+        BINARY_PLAIN_ENCODING_VAL,
+        &[1, 2, 3]
+    )]
+    #[case::none_bytes(Option::<Vec<u8>>::None, BINARY_NULL_ENCODING_VAL, b"")]
+    fn value_encodes_as<T>(
+        #[case] value: T,
+        #[case] expected_encoding: &str,
+        #[case] expected_data: &[u8],
+    ) where
+        T: TemporalSerializable + std::fmt::Debug + 'static,
+    {
         let converter = PayloadConverter::default();
         let ctx = SerializationContext::new(&SerializationContextData::Workflow, &converter);
 
-        let payloads = converter.to_payloads(&ctx, &()).unwrap();
-        assert!(payloads.is_empty());
+        let payload = converter.to_payload(&ctx, &value).unwrap();
 
-        let result: () = converter.from_payloads(&ctx, payloads).unwrap();
-        assert_eq!(result, ());
+        assert_eq!(
+            payload.metadata.get(ENCODING_PAYLOAD_KEY).unwrap(),
+            expected_encoding.as_bytes()
+        );
+        assert_eq!(payload.data, expected_data);
     }
 
-    #[test]
-    fn test_unit_to_payload_roundtrip() {
+    #[rstest]
+    #[case::unit(BINARY_NULL_ENCODING_VAL, b"", ())]
+    #[case::none_string(BINARY_NULL_ENCODING_VAL, b"", Option::<String>::None)]
+    #[case::legacy_none_string(JSON_ENCODING_VAL, b"null", Option::<String>::None)]
+    #[case::bytes(BINARY_PLAIN_ENCODING_VAL, &[0, 1, 2, 255], vec![0_u8, 1, 2, 255])]
+    #[case::legacy_bytes(JSON_ENCODING_VAL, b"[3,2,1]", vec![3_u8, 2, 1])]
+    #[case::some_bytes(
+        BINARY_PLAIN_ENCODING_VAL,
+        &[1, 2, 3],
+        Some(vec![1_u8, 2, 3])
+    )]
+    #[case::none_bytes(BINARY_NULL_ENCODING_VAL, b"", Option::<Vec<u8>>::None)]
+    #[case::legacy_some_bytes(
+        JSON_ENCODING_VAL,
+        b"[3,2,1]",
+        Some(vec![3_u8, 2, 1])
+    )]
+    #[case::legacy_none_bytes(JSON_ENCODING_VAL, b"null", Option::<Vec<u8>>::None)]
+    fn payload_decodes_as<T>(#[case] encoding: &str, #[case] data: &[u8], #[case] expected: T)
+    where
+        T: TemporalDeserializable + std::fmt::Debug + PartialEq + 'static,
+    {
         let converter = PayloadConverter::default();
         let ctx = SerializationContext::new(&SerializationContextData::Workflow, &converter);
 
-        let mut payloads = vec![converter.to_payload(&ctx, &()).unwrap()];
-        assert!(is_unit_payloads(&payloads));
-        let result: () = converter
-            .from_payload(&ctx, payloads.pop().unwrap())
+        let actual: T = converter
+            .from_payload(
+                &ctx,
+                Payload {
+                    metadata: HashMap::from([(
+                        ENCODING_PAYLOAD_KEY.to_string(),
+                        encoding.as_bytes().to_vec(),
+                    )]),
+                    data: data.to_vec(),
+                    external_payloads: vec![],
+                },
+            )
             .unwrap();
-        assert_eq!(result, ());
+        assert_eq!(actual, expected);
     }
 
     #[test]
     fn use_wrappers_returns_wrong_encoding_for_standard_types() {
         let converter = PayloadConverter::UseWrappers;
         let ctx = SerializationContext::new(&SerializationContextData::Workflow, &converter);
+
+        let result = converter.to_payload(&ctx, &());
+        assert!(
+            matches!(result, Err(PayloadConversionError::WrongEncoding)),
+            "{result:?}"
+        );
 
         let result = converter.to_payloads(&ctx, &());
         assert!(
@@ -922,6 +940,12 @@ mod tests {
         );
 
         let result = converter.to_payloads(&ctx, &vec![1_u8, 2, 3]);
+        assert!(
+            matches!(result, Err(PayloadConversionError::WrongEncoding)),
+            "{result:?}"
+        );
+
+        let result: Result<(), _> = converter.from_payload(&ctx, binary_null_payload());
         assert!(
             matches!(result, Err(PayloadConversionError::WrongEncoding)),
             "{result:?}"
@@ -942,98 +966,6 @@ mod tests {
     }
 
     #[test]
-    fn option_none_uses_binary_null_and_accepts_legacy_json_null() {
-        let converter = PayloadConverter::default();
-        let ctx = SerializationContext::new(&SerializationContextData::Workflow, &converter);
-
-        let payloads = converter
-            .to_payloads(&ctx, &Option::<String>::None)
-            .unwrap();
-        assert_eq!(payloads.len(), 1);
-        assert!(is_binary_null_payload(&payloads[0]));
-
-        let result: Option<String> = converter
-            .from_payload(&ctx, payloads.into_iter().next().unwrap())
-            .unwrap();
-        assert_eq!(result, None);
-
-        let legacy_json_null = Payload {
-            metadata: HashMap::from([("encoding".to_string(), b"json/plain".to_vec())]),
-            data: b"null".to_vec(),
-            external_payloads: vec![],
-        };
-        let result: Option<String> = converter.from_payload(&ctx, legacy_json_null).unwrap();
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn non_null_option_retains_json_encoding() {
-        let converter = PayloadConverter::default();
-        let ctx = SerializationContext::new(&SerializationContextData::Workflow, &converter);
-
-        let payload = converter
-            .to_payload(&ctx, &Some("value".to_string()))
-            .unwrap();
-        assert_eq!(payload.metadata.get("encoding").unwrap(), b"json/plain");
-        assert_eq!(payload.data, br#""value""#);
-    }
-
-    #[test]
-    fn vec_u8_uses_binary_plain_and_accepts_legacy_json() {
-        let converter = PayloadConverter::default();
-        let ctx = SerializationContext::new(&SerializationContextData::Workflow, &converter);
-
-        let payload = converter.to_payload(&ctx, &vec![0_u8, 1, 2, 255]).unwrap();
-        assert_eq!(payload.metadata.get("encoding").unwrap(), b"binary/plain");
-        assert_eq!(payload.data, vec![0, 1, 2, 255]);
-
-        let result: Vec<u8> = converter.from_payload(&ctx, payload).unwrap();
-        assert_eq!(result, vec![0, 1, 2, 255]);
-
-        let legacy_json = Payload {
-            metadata: HashMap::from([("encoding".to_string(), b"json/plain".to_vec())]),
-            data: b"[3,2,1]".to_vec(),
-            external_payloads: vec![],
-        };
-        let result: Vec<u8> = converter.from_payload(&ctx, legacy_json).unwrap();
-        assert_eq!(result, vec![3, 2, 1]);
-    }
-
-    #[test]
-    fn option_vec_u8_uses_binary_encodings_and_accepts_legacy_json() {
-        let converter = PayloadConverter::default();
-        let ctx = SerializationContext::new(&SerializationContextData::Workflow, &converter);
-
-        let payload = converter.to_payload(&ctx, &Some(vec![1_u8, 2, 3])).unwrap();
-        assert_eq!(payload.metadata.get("encoding").unwrap(), b"binary/plain");
-        let result: Option<Vec<u8>> = converter.from_payload(&ctx, payload).unwrap();
-        assert_eq!(result, Some(vec![1, 2, 3]));
-
-        let payload = converter
-            .to_payload(&ctx, &Option::<Vec<u8>>::None)
-            .unwrap();
-        assert!(is_binary_null_payload(&payload));
-        let result: Option<Vec<u8>> = converter.from_payload(&ctx, payload).unwrap();
-        assert_eq!(result, None);
-
-        let legacy_json = Payload {
-            metadata: HashMap::from([("encoding".to_string(), b"json/plain".to_vec())]),
-            data: b"[3,2,1]".to_vec(),
-            external_payloads: vec![],
-        };
-        let result: Option<Vec<u8>> = converter.from_payload(&ctx, legacy_json).unwrap();
-        assert_eq!(result, Some(vec![3, 2, 1]));
-
-        let legacy_json_null = Payload {
-            metadata: HashMap::from([("encoding".to_string(), b"json/plain".to_vec())]),
-            data: b"null".to_vec(),
-            external_payloads: vec![],
-        };
-        let result: Option<Vec<u8>> = converter.from_payload(&ctx, legacy_json_null).unwrap();
-        assert_eq!(result, None);
-    }
-
-    #[test]
     fn empty_payloads_do_not_decode_as_option() {
         let converter = PayloadConverter::default();
         let ctx = SerializationContext::new(&SerializationContextData::Workflow, &converter);
@@ -1048,49 +980,30 @@ mod tests {
         assert_eq!(args, MultiArgs2("hello".to_string(), 42));
     }
 
-    fn decodable_from_value<T: TemporalSerializable + 'static>(value: &T) -> DecodablePayloads {
+    #[rstest]
+    #[case::string("hello".to_string())]
+    #[case::some_string(Some("hello".to_string()))]
+    #[case::none_string(Option::<String>::None)]
+    #[case::unit(())]
+    #[case::strings(vec!["hello".to_string(), "world".to_string()])]
+    #[case::bytes(vec![1_u8, 2, 3])]
+    #[case::some_bytes(Some(vec![1_u8, 2, 3]))]
+    #[case::none_bytes(Option::<Vec<u8>>::None)]
+    fn decodable_payloads_roundtrip<T>(#[case] value: T)
+    where
+        T: TemporalSerializable + TemporalDeserializable + std::fmt::Debug + PartialEq + 'static,
+    {
         let converter = PayloadConverter::default();
         let payloads = converter
             .to_payloads(
                 &SerializationContext::new(&SerializationContextData::Workflow, &converter),
-                value,
+                &value,
             )
             .unwrap();
-        DecodablePayloads::new(payloads, converter, SerializationContextData::Workflow)
-    }
-    #[test]
-    fn decodable_payloads_roundtrip_string() {
-        let payloads = decodable_from_value(&"hello".to_string());
+        let payloads =
+            DecodablePayloads::new(payloads, converter, SerializationContextData::Workflow);
 
-        let result: String = payloads.deserialize().unwrap();
-
-        assert_eq!(result, "hello");
-    }
-
-    #[test]
-    fn decodable_payloads_roundtrip_option_string() {
-        let payloads = decodable_from_value(&Some("hello".to_string()));
-
-        let result: Option<String> = payloads.deserialize().unwrap();
-
-        assert_eq!(result, Some("hello".to_string()));
-    }
-
-    #[test]
-    fn decodable_payloads_roundtrip_unit() {
-        let payloads = decodable_from_value(&());
-
-        let result: () = payloads.deserialize().unwrap();
-
-        assert_eq!(result, ());
-    }
-
-    #[test]
-    fn decodable_payloads_roundtrip_vec_string() {
-        let payloads = decodable_from_value(&vec!["hello".to_string(), "world".to_string()]);
-
-        let result: Vec<String> = payloads.deserialize().unwrap();
-
-        assert_eq!(result, vec!["hello".to_string(), "world".to_string()]);
+        let result: T = payloads.deserialize().unwrap();
+        assert_eq!(result, value);
     }
 }
