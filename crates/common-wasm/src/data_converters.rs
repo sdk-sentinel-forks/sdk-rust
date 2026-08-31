@@ -6,7 +6,7 @@ mod well_known;
 
 pub use failure_converter::{
     ActivityExecutionDecodeHint, ChildWorkflowExecutionDecodeHint, ChildWorkflowStartDecodeHint,
-    DefaultFailureConverter, FailureConverter, FailureDecodeHint, NoopDecodeHint,
+    CommonAttributes, DefaultFailureConverter, FailureConverter, FailureDecodeHint, NoopDecodeHint,
     WorkflowSignalDecodeHint,
 };
 use well_known::{BINARY_NULL_ENCODING_VAL, WellKnownType, binary_null_payload};
@@ -748,7 +748,7 @@ impl Default for DataConverter {
     fn default() -> Self {
         Self::new(
             PayloadConverter::default(),
-            DefaultFailureConverter,
+            DefaultFailureConverter::default(),
             DefaultPayloadCodec,
         )
     }

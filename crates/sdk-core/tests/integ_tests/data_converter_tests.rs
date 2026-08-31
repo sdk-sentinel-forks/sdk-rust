@@ -159,7 +159,7 @@ impl FailureConverter for FailingFailureConverter {
         payload_converter: &PayloadConverter,
         context: &SerializationContextData,
     ) -> Result<IncomingError, PayloadConversionError> {
-        DefaultFailureConverter.to_error(failure, payload_converter, context)
+        DefaultFailureConverter::default().to_error(failure, payload_converter, context)
     }
 }
 
@@ -793,9 +793,9 @@ async fn option_none_workflow_input_is_recorded_as_binary_null() {
 
     let events = handle
         .fetch_history(Default::default())
+        .into_events()
         .await
-        .unwrap()
-        .into_events();
+        .unwrap();
     let input = events
         .iter()
         .find_map(|event| match event.attributes.as_ref() {
@@ -1018,7 +1018,7 @@ async fn codec_errors_fail_tasks_and_retry(#[case] failure_point: CodecFailurePo
     let connection = get_integ_connection(None).await;
     let data_converter = DataConverter::new(
         PayloadConverter::default(),
-        DefaultFailureConverter,
+        DefaultFailureConverter::default(),
         codec.clone(),
     );
     let client_opts = ClientOptions::new(integ_namespace())
@@ -1066,7 +1066,7 @@ async fn codec_encodes_and_decodes_payloads() {
     let connection = get_integ_connection(None).await;
     let data_converter = DataConverter::new(
         PayloadConverter::default(),
-        DefaultFailureConverter,
+        DefaultFailureConverter::default(),
         codec.clone(),
     );
     let client_opts = ClientOptions::new(integ_namespace())
@@ -1124,7 +1124,7 @@ async fn describe_decodes_workflow_payload_fields() {
     let connection = get_integ_connection(None).await;
     let data_converter = DataConverter::new(
         PayloadConverter::default(),
-        DefaultFailureConverter,
+        DefaultFailureConverter::default(),
         codec.clone(),
     );
     let client_opts = ClientOptions::new(integ_namespace())
@@ -1202,7 +1202,7 @@ async fn describe_decodes_user_metadata_with_ungated_xor_codec() {
     let connection = get_integ_connection(None).await;
     let data_converter = DataConverter::new(
         PayloadConverter::default(),
-        DefaultFailureConverter,
+        DefaultFailureConverter::default(),
         codec.clone(),
     );
     let client_opts = ClientOptions::new(integ_namespace())
@@ -1266,7 +1266,7 @@ async fn codec_roundtrips_activity_cancellation_details() {
     let connection = get_integ_connection(None).await;
     let data_converter = DataConverter::new(
         PayloadConverter::default(),
-        DefaultFailureConverter,
+        DefaultFailureConverter::default(),
         codec.clone(),
     );
     let client_opts = ClientOptions::new(integ_namespace())
@@ -1315,7 +1315,7 @@ async fn codec_roundtrips_activity_heartbeat_timeout_details() {
     let connection = get_integ_connection(None).await;
     let data_converter = DataConverter::new(
         PayloadConverter::default(),
-        DefaultFailureConverter,
+        DefaultFailureConverter::default(),
         codec.clone(),
     );
     let client_opts = ClientOptions::new(integ_namespace())

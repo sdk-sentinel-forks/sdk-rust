@@ -34,6 +34,8 @@ relevant information.
 ## Unreleased
 
 ### Added
+* `DefaultFailureConverter::new(true)` moves failure messages and stack traces into encoded
+  attributes so payload codecs can encrypt them.
 * `LocalActivityOptions::include_arguments_into_marker` allows Rust workflows to opt in to
   recording local activity arguments in Workflow history.
 * `WorkflowHandle::get_update_handle` creates a typed handle for an existing Workflow Update from
@@ -59,6 +61,7 @@ relevant information.
   `ClientInterceptor::update_with_start_workflow`.
 
 ### Breaking Changes :boom:
+* `DefaultFailureConverter` is no longer a unit struct. Use `DefaultFailureConverter::default()` instead.
 * `WorkflowHandle::fetch_history` now returns a lazy `WorkflowHistory` stream instead
   of eagerly fetching every history page. Use `WorkflowHistory::into_events` if eager fetching
   is desired.
@@ -99,6 +102,8 @@ relevant information.
   `Waiting for all slot permits to release took too long!`, and release builds logged that error
   and dropped the result, leaving the server to time the activity out before retrying it.
   Shutdown now drains in-flight completions first.
+* Standalone activity result and describe APIs now apply the configured payload codec when
+  decoding failures, so encoded failure attributes and details are restored correctly.
 * The default payload converter now serializes Serde `null` values such as `Option::None` as
   `binary/null` and accepts both `binary/null` and legacy `json/plain` null payloads.
 * The Prometheus exporter now respects `PrometheusExporterOptions::counters_total_suffix`,
