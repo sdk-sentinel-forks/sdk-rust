@@ -108,6 +108,8 @@ relevant information.
   non-sticky poller, so the worker would stop picking up new workflows until a poll timed out (up to
   ~60s). The poll balancer now reserves a non-sticky slot against the cache size rather than the
   slot-supplier size.
+* The default payload converter now encodes `Vec<u8>` and `Option<Vec<u8>>` as `binary/plain` when
+  present.
 
 ## [0.7.0] - 2026-08-17
 
