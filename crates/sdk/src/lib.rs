@@ -1,3 +1,4 @@
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs)] // error if there are missing docs
 
 //! This crate defines a Public Preview Temporal Rust SDK.
@@ -66,6 +67,7 @@ extern crate self as temporalio_sdk;
 pub mod activities;
 pub mod error;
 pub mod interceptors;
+#[cfg(feature = "experimental")]
 /// Experimental APIs for configuring clients and workers with reusable plugins.
 pub mod plugins;
 pub mod runtime;
@@ -81,6 +83,10 @@ pub mod workflow_replayer;
 mod workflow_wasm;
 pub mod workflows;
 
+#[cfg(feature = "experimental")]
+pub use crate::plugins::{
+    ClientAndWorkerPlugin, SimplePlugin, SimplePluginBuilder, SimplePluginOption, WorkerPlugin,
+};
 pub use crate::{
     error::{
         ActivityExecutionError, ApplicationFailure, ChildWorkflowExecutionError,
@@ -88,24 +94,24 @@ pub use crate::{
         RetryState, TimeoutType, WorkerCreateError, WorkerRunError, WorkerValidationError,
         WorkflowRegistrationError, WorkflowSignalError,
     },
-    plugins::{
-        ClientAndWorkerPlugin, SimplePlugin, SimplePluginBuilder, SimplePluginOption, WorkerPlugin,
-        WorkflowDefinitions,
-    },
+    workflow_registry::WorkflowDefinitions,
 };
 pub use runtime::Runtime;
 pub use temporalio_client::Namespace;
 pub use temporalio_workflow::{
     ActivityCancellationType, ActivityCloseTimeouts, ActivityOptions, BaseWorkflowContext,
     CancellableFuture, CancellableFutureWithReason, ChildWorkflowCancellationType,
-    ChildWorkflowOptions, ContinueAsNewOptions, ContinueAsNewVersioningBehavior,
-    ExternalWorkflowHandle, LocalActivityOptions, MemoValue, NexusOperationCancellationType,
-    NexusOperationOptions, ParentClosePolicy, PatchActivationCallback, SignalWorkflowOptions,
-    StartChildWorkflowExecutionFailedCause, StartChildWorkflowOutput, StartedChildWorkflow,
-    StartedNexusOperation, SyncWorkflowContext, TimerOptions, TimerResult, VersioningIntent,
-    WaitConditionOptions, WorkflowCancellationError, WorkflowCancellationToken, WorkflowContext,
-    WorkflowContextView, WorkflowIdReusePolicy, WorkflowRandomValue, WorkflowResult,
-    WorkflowTermination,
+    ChildWorkflowOptions, ContinueAsNewOptions, ExternalWorkflowHandle, LocalActivityOptions,
+    MemoValue, ParentClosePolicy, SignalWorkflowOptions, StartChildWorkflowExecutionFailedCause,
+    StartChildWorkflowOutput, StartedChildWorkflow, SyncWorkflowContext, TimerOptions, TimerResult,
+    VersioningIntent, WaitConditionOptions, WorkflowCancellationError, WorkflowCancellationToken,
+    WorkflowContext, WorkflowContextView, WorkflowIdReusePolicy, WorkflowRandomValue,
+    WorkflowResult, WorkflowTermination,
+};
+#[cfg(feature = "experimental")]
+pub use temporalio_workflow::{
+    ContinueAsNewVersioningBehavior, NexusOperationCancellationType, NexusOperationOptions,
+    PatchActivationCallback, PatchActivationInput, StartedNexusOperation,
 };
 #[cfg(feature = "wasm-workflows")]
 pub use workflow_wasm::WasmWorkflowComponent;
@@ -132,6 +138,8 @@ use std::{
     time::Duration,
 };
 use temporalio_client::{Client, ClientOptions, NamespacedClient};
+#[cfg(feature = "experimental")]
+use temporalio_common::protos::temporal::api::worker::v1::PluginInfo;
 use temporalio_common::{
     ActivityDefinition, WorkflowDefinition,
     data_converters::{
@@ -150,13 +158,14 @@ use temporalio_common::{
         },
         temporal::api::{
             common::v1::Payload, enums::v1::WorkflowTaskFailedCause, failure::v1::Failure,
-            worker::v1::PluginInfo,
         },
     },
     worker::{WorkerDeploymentOptions, WorkerTaskTypes, build_id_from_current_exe},
 };
 use temporalio_sdk_core::{PollError, init_worker};
-use temporalio_workflow::runtime::entry::WorkflowImplementation;
+use temporalio_workflow::{
+    InternalPatchActivationCallback, runtime::entry::WorkflowImplementation,
+};
 use tokio::sync::{
     Notify,
     mpsc::{UnboundedSender, unbounded_channel},
@@ -200,9 +209,11 @@ pub struct WorkerOptions {
     workflow_interceptor_constructors: Vec<WorkflowInterceptorConstructor>,
 
     #[builder(field)]
+    #[cfg(feature = "experimental")]
     worker_plugins: Vec<Arc<dyn WorkerPlugin>>,
 
     #[builder(field)]
+    #[cfg(feature = "experimental")]
     client_plugin_names: HashSet<String>,
 
     #[cfg(feature = "wasm-workflows")]
@@ -303,6 +314,14 @@ pub struct WorkerOptions {
     /// exceed the namespace error limits; oversized payloads are sent to server, which enforces the
     /// limit. Defaults to false.
     /// NOTE: Experimental
+    #[cfg(feature = "experimental")]
+    #[cfg_attr(
+        docsrs,
+        builder(setters(
+            some_fn(name = disable_payload_error_limit_impl, vis = "pub(crate)"),
+            option_fn(name = maybe_disable_payload_error_limit_impl, vis = "pub(crate)")
+        ))
+    )]
     #[builder(default = false)]
     pub disable_payload_error_limit: bool,
     /// Experimental callback that decides whether the first non-replay call to
@@ -312,7 +331,68 @@ pub struct WorkerOptions {
     /// `true` records the patch marker; returning `false` leaves the patch inactive for the
     /// workflow run. For registered WASM workflow components, the callback remains on the worker
     /// host and is invoked through the workflow component's synchronous host interface.
+    #[cfg(feature = "experimental")]
+    #[cfg_attr(
+        docsrs,
+        builder(setters(
+            some_fn(name = patch_activation_callback_impl, vis = "pub(crate)"),
+            option_fn(name = maybe_patch_activation_callback_impl, vis = "pub(crate)")
+        ))
+    )]
     pub patch_activation_callback: Option<PatchActivationCallback>,
+}
+
+// Bon does not propagate `doc(cfg)` to generated setters, so these docs-only methods forward to
+// renamed generated implementations.
+#[cfg(all(feature = "experimental", docsrs))]
+impl<S: worker_options_builder::State> WorkerOptionsBuilder<S> {
+    /// Set whether payloads over the namespace error limit are sent to the server.
+    #[doc(cfg(feature = "experimental"))]
+    pub fn disable_payload_error_limit(
+        self,
+        value: bool,
+    ) -> WorkerOptionsBuilder<worker_options_builder::SetDisablePayloadErrorLimit<S>>
+    where
+        S::DisablePayloadErrorLimit: worker_options_builder::IsUnset,
+    {
+        self.disable_payload_error_limit_impl(value)
+    }
+
+    /// Set the payload error limit override from an optional value.
+    #[doc(cfg(feature = "experimental"))]
+    pub fn maybe_disable_payload_error_limit(
+        self,
+        value: Option<bool>,
+    ) -> WorkerOptionsBuilder<worker_options_builder::SetDisablePayloadErrorLimit<S>>
+    where
+        S::DisablePayloadErrorLimit: worker_options_builder::IsUnset,
+    {
+        self.maybe_disable_payload_error_limit_impl(value)
+    }
+
+    /// Set the callback used to decide whether a patch should activate.
+    #[doc(cfg(feature = "experimental"))]
+    pub fn patch_activation_callback(
+        self,
+        value: PatchActivationCallback,
+    ) -> WorkerOptionsBuilder<worker_options_builder::SetPatchActivationCallback<S>>
+    where
+        S::PatchActivationCallback: worker_options_builder::IsUnset,
+    {
+        self.patch_activation_callback_impl(value)
+    }
+
+    /// Set the patch activation callback from an optional value.
+    #[doc(cfg(feature = "experimental"))]
+    pub fn maybe_patch_activation_callback(
+        self,
+        value: Option<PatchActivationCallback>,
+    ) -> WorkerOptionsBuilder<worker_options_builder::SetPatchActivationCallback<S>>
+    where
+        S::PatchActivationCallback: worker_options_builder::IsUnset,
+    {
+        self.maybe_patch_activation_callback_impl(value)
+    }
 }
 
 impl<S: worker_options_builder::State> WorkerOptionsBuilder<S> {
@@ -337,6 +417,7 @@ impl<S: worker_options_builder::State> WorkerOptionsBuilder<S> {
         self
     }
 
+    #[cfg(feature = "experimental")]
     pub(crate) fn with_worker_plugins(
         mut self,
         worker_plugins: Vec<Arc<dyn WorkerPlugin>>,
@@ -357,12 +438,14 @@ impl<S: worker_options_builder::State> WorkerOptionsBuilder<S> {
     /// Register a worker plugin.
     ///
     /// **Experimental:** This API may change or be removed.
+    #[cfg(feature = "experimental")]
     pub fn worker_plugin<P: WorkerPlugin>(mut self, plugin: P) -> Self {
         self.worker_plugins.push(Arc::new(plugin));
         self
     }
 
     /// Append a worker interceptor. Interceptors run in registration order.
+    #[cfg(feature = "experimental")]
     pub fn worker_interceptor<I: WorkerInterceptor + 'static>(mut self, interceptor: I) -> Self {
         self.worker_interceptors.push(Arc::new(interceptor));
         self
@@ -475,6 +558,7 @@ fn def_build_id() -> WorkerDeploymentOptions {
 
 impl WorkerOptions {
     /// Append a worker interceptor. Interceptors run in registration order.
+    #[cfg(feature = "experimental")]
     pub fn worker_interceptor<I: WorkerInterceptor + 'static>(
         &mut self,
         interceptor: I,
@@ -588,6 +672,25 @@ impl WorkerOptions {
         if !workflows_registered && !activities_registered {
             return Err("At least one workflow or activity must be registered".to_owned());
         }
+        #[cfg(feature = "experimental")]
+        let disable_payload_error_limit = self.disable_payload_error_limit;
+        #[cfg(not(feature = "experimental"))]
+        let disable_payload_error_limit = false;
+        #[cfg(feature = "experimental")]
+        let plugin_info = self
+            .client_plugin_names
+            .iter()
+            .map(|name| PluginInfo {
+                name: name.clone(),
+                version: String::new(),
+            })
+            .chain(self.worker_plugins.iter().map(|registration| PluginInfo {
+                name: registration.name().to_owned(),
+                version: String::new(),
+            }))
+            .collect();
+        #[cfg(not(feature = "experimental"))]
+        let plugin_info = HashSet::new();
 
         WorkerConfig::builder()
             .namespace(namespace)
@@ -626,20 +729,8 @@ impl WorkerOptions {
             ))
             .workflow_failure_errors(self.workflow_failure_errors.clone())
             .workflow_types_to_failure_errors(self.workflow_types_to_failure_errors.clone())
-            .plugins(
-                self.client_plugin_names
-                    .iter()
-                    .map(|name| PluginInfo {
-                        name: name.clone(),
-                        version: String::new(),
-                    })
-                    .chain(self.worker_plugins.iter().map(|registration| PluginInfo {
-                        name: registration.name().to_owned(),
-                        version: String::new(),
-                    }))
-                    .collect(),
-            )
-            .disable_payload_error_limit(self.disable_payload_error_limit)
+            .plugins(plugin_info)
+            .disable_payload_error_limit(disable_payload_error_limit)
             .build()
     }
 }
@@ -677,7 +768,7 @@ struct WorkflowHalf {
     workflow_removed_from_map: Notify,
     detect_nondeterministic_futures: bool,
     #[debug(skip)]
-    patch_activation_callback: Option<PatchActivationCallback>,
+    patch_activation_callback: Option<InternalPatchActivationCallback>,
 }
 #[derive(Debug)]
 struct WorkflowData {
@@ -783,8 +874,11 @@ impl Worker {
     pub fn new(
         runtime: &Runtime,
         client: Client,
-        mut options: WorkerOptions,
+        options: WorkerOptions,
     ) -> Result<Self, WorkerCreateError> {
+        #[cfg(feature = "experimental")]
+        let mut options = options;
+        #[cfg(feature = "experimental")]
         plugins::apply_worker_plugins(client.options(), &mut options)?;
         let wc = options
             .to_core_options(client.namespace(), client.identity())
@@ -816,8 +910,11 @@ impl Worker {
     pub fn new_from_core_options(
         worker: Arc<CoreWorker>,
         client_options: ClientOptions,
-        mut options: WorkerOptions,
+        options: WorkerOptions,
     ) -> Result<Self, WorkerCreateError> {
+        #[cfg(feature = "experimental")]
+        let mut options = options;
+        #[cfg(feature = "experimental")]
         plugins::apply_worker_plugins(&client_options, &mut options)?;
         Self::new_from_core_options_prepared(worker, client_options, options)
     }
@@ -846,7 +943,10 @@ impl Worker {
             workflow_interceptor_constructors,
         );
         me.set_detect_nondeterministic_futures(options.detect_nondeterministic_futures);
-        me.workflow_half.patch_activation_callback = options.patch_activation_callback;
+        #[cfg(feature = "experimental")]
+        {
+            me.workflow_half.patch_activation_callback = options.patch_activation_callback;
+        }
         #[cfg(feature = "wasm-workflows")]
         me.workflow_half
             .workflow_definitions
@@ -1748,30 +1848,6 @@ mod tests {
             .unwrap();
     }
 
-    #[test]
-    fn simple_plugin_workflow_function_merges_definitions() {
-        let plugin = SimplePlugin::builder("simple")
-            .workflows(|existing: Option<WorkflowDefinitions>| {
-                assert!(existing.is_some());
-                let mut workflows = WorkflowDefinitions::new();
-                workflows.register_workflow::<OtherWorkflow>().unwrap();
-                workflows
-            })
-            .build();
-        let client_options = ClientOptions::new("namespace").build();
-        let mut worker_options = WorkerOptions::new("task_q")
-            .register_workflow::<MyWorkflow>()
-            .unwrap()
-            .worker_plugin(plugin)
-            .build();
-
-        crate::plugins::apply_worker_plugins(&client_options, &mut worker_options).unwrap();
-
-        let workflows = format!("{:?}", worker_options.workflows());
-        assert!(workflows.contains("MyWorkflow"));
-        assert!(workflows.contains("OtherWorkflow"));
-    }
-
     #[rstest::rstest]
     #[case::workflow_only(true, false, Ok(WorkerTaskTypes::workflow_only()))]
     #[case::activity_only(false, true, Ok(WorkerTaskTypes::activity_only()))]
@@ -1907,24 +1983,6 @@ mod tests {
         assert_eq!(config.client_identity_override, expected);
     }
 
-    #[rstest::rstest]
-    #[case::default_enforces_error_limit(None, false)]
-    #[case::opt_out_disables_error_limit(Some(true), true)]
-    #[case::explicit_enable_error_limit(Some(false), false)]
-    #[test]
-    fn disable_payload_error_limit_propagates(
-        #[case] override_value: Option<bool>,
-        #[case] expected: bool,
-    ) {
-        let config = WorkerOptions::new("task_q")
-            .register_activities(MyActivities {})
-            .maybe_disable_payload_error_limit(override_value)
-            .build()
-            .to_core_options("ns".into(), String::new())
-            .unwrap();
-        assert_eq!(config.disable_payload_error_limit, expected);
-    }
-
     #[test]
     fn max_eager_activity_reservations_per_workflow_task_propagates() {
         let config = WorkerOptions::new("task_q")
@@ -1934,5 +1992,52 @@ mod tests {
             .to_core_options("ns".into(), String::new())
             .unwrap();
         assert_eq!(config.max_eager_activity_reservations_per_workflow_task, 7);
+    }
+
+    #[cfg(feature = "experimental")]
+    mod experimental_tests {
+        use super::*;
+
+        #[test]
+        fn simple_plugin_workflow_function_merges_definitions() {
+            let plugin = SimplePlugin::builder("simple")
+                .workflows(|existing: Option<WorkflowDefinitions>| {
+                    assert!(existing.is_some());
+                    let mut workflows = WorkflowDefinitions::new();
+                    workflows.register_workflow::<OtherWorkflow>().unwrap();
+                    workflows
+                })
+                .build();
+            let client_options = ClientOptions::new("namespace").build();
+            let mut worker_options = WorkerOptions::new("task_q")
+                .register_workflow::<MyWorkflow>()
+                .unwrap()
+                .worker_plugin(plugin)
+                .build();
+
+            crate::plugins::apply_worker_plugins(&client_options, &mut worker_options).unwrap();
+
+            let workflows = format!("{:?}", worker_options.workflows());
+            assert!(workflows.contains("MyWorkflow"));
+            assert!(workflows.contains("OtherWorkflow"));
+        }
+
+        #[rstest::rstest]
+        #[case::default_enforces_error_limit(None, false)]
+        #[case::opt_out_disables_error_limit(Some(true), true)]
+        #[case::explicit_enable_error_limit(Some(false), false)]
+        #[test]
+        fn disable_payload_error_limit_propagates(
+            #[case] override_value: Option<bool>,
+            #[case] expected: bool,
+        ) {
+            let config = WorkerOptions::new("task_q")
+                .register_activities(MyActivities {})
+                .maybe_disable_payload_error_limit(override_value)
+                .build()
+                .to_core_options("ns".into(), String::new())
+                .unwrap();
+            assert_eq!(config.disable_payload_error_limit, expected);
+        }
     }
 }

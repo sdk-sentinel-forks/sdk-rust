@@ -454,7 +454,7 @@ pub(crate) fn apply_workflow_replayer_plugins(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "experimental"))]
 mod tests {
     use super::*;
     use std::{

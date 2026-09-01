@@ -1,3 +1,4 @@
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs)] // error if there are missing docs
 
 //! This crate contains client implementations that can be used to contact the Temporal service.
@@ -20,6 +21,7 @@ pub mod grpc;
 pub mod interceptors;
 mod metrics;
 mod options_structs;
+#[cfg(feature = "experimental")]
 /// Experimental APIs for configuring clients with reusable plugins.
 pub mod plugins;
 /// Visible only for tests
@@ -65,6 +67,7 @@ pub use interceptors::{
 };
 pub use metrics::{LONG_REQUEST_LATENCY_HISTOGRAM_NAME, REQUEST_LATENCY_HISTOGRAM_NAME};
 pub use options_structs::*;
+#[cfg(feature = "experimental")]
 pub use plugins::{
     ClientPlugin, ErasedClientPlugin, PluginApplyError, PluginError, PluginTarget, WorkerPluginData,
 };
@@ -432,6 +435,14 @@ impl Connection {
         } else {
             None
         };
+        #[cfg(feature = "experimental")]
+        let payloads_warn_size = options.payload_limits.payloads_warn_size;
+        #[cfg(not(feature = "experimental"))]
+        let payloads_warn_size = options_structs::DEFAULT_PAYLOADS_WARN_SIZE;
+        #[cfg(feature = "experimental")]
+        let memo_warn_size = options.payload_limits.memo_warn_size;
+        #[cfg(not(feature = "experimental"))]
+        let memo_warn_size = options_structs::DEFAULT_MEMO_WARN_SIZE;
         Ok(Self {
             inner: Arc::new(ConnectionInner {
                 service: svc_client,
@@ -445,12 +456,9 @@ impl Connection {
                 _dns_task: dns_task,
                 payloads_warn_size: resolve_warn_threshold(
                     "payloads_warn_size",
-                    options.payload_limits.payloads_warn_size,
+                    payloads_warn_size,
                 ),
-                memo_warn_size: resolve_warn_threshold(
-                    "memo_warn_size",
-                    options.payload_limits.memo_warn_size,
-                ),
+                memo_warn_size: resolve_warn_threshold("memo_warn_size", memo_warn_size),
             }),
         })
     }
@@ -1097,9 +1105,12 @@ impl Client {
     /// Connect to a Temporal service and create a namespace-bound client, applying registered
     /// plugins to connection and client options in registration order.
     pub async fn connect(
-        mut connection_options: ConnectionOptions,
+        connection_options: ConnectionOptions,
         client_options: ClientOptions,
     ) -> Result<Self, ClientConnectError> {
+        #[cfg(feature = "experimental")]
+        let mut connection_options = connection_options;
+        #[cfg(feature = "experimental")]
         plugins::apply_connection_plugins(&client_options, &mut connection_options)?;
         let connection = Connection::connect(connection_options).await?;
         Ok(Self::new(connection, client_options)?)
@@ -1109,7 +1120,10 @@ impl Client {
     ///
     /// Registered client plugins are applied here. Connection plugin hooks only run when using
     /// [`Client::connect`].
-    pub fn new(connection: Connection, mut options: ClientOptions) -> Result<Self, ClientNewError> {
+    pub fn new(connection: Connection, options: ClientOptions) -> Result<Self, ClientNewError> {
+        #[cfg(feature = "experimental")]
+        let mut options = options;
+        #[cfg(feature = "experimental")]
         plugins::apply_client_plugins(&mut options)?;
         Ok(Client {
             connection,
@@ -1808,6 +1822,7 @@ fn build_start_workflow_request(
     options: WorkflowStartOptions,
 ) -> StartWorkflowExecutionRequest {
     let user_metadata = options.user_metadata();
+    let request_eager_execution = options.enable_eager_workflow_start;
     StartWorkflowExecutionRequest {
         namespace: client.namespace(),
         input,
@@ -1837,7 +1852,7 @@ fn build_start_workflow_request(
             .search_attributes
             .map(|attributes| attributes.into_proto()),
         cron_schedule: options.cron_schedule.unwrap_or_default(),
-        request_eager_execution: options.enable_eager_workflow_start,
+        request_eager_execution,
         retry_policy: options.retry_policy.map(Into::into),
         links: options.links,
         completion_callbacks: options.completion_callbacks,

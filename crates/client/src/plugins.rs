@@ -174,7 +174,7 @@ pub(crate) fn apply_client_plugins(options: &mut ClientOptions) -> Result<(), Pl
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "experimental"))]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};

@@ -1,7 +1,8 @@
+#[cfg(feature = "experimental")]
+use crate::plugins::WorkerPlugin;
 use crate::{
     Worker, WorkerOptions, WorkerRunError,
     interceptors::{self, Next, WithWorkflowReplayWorkerInput, WorkerInterceptor},
-    plugins::WorkerPlugin,
     runtime::WorkflowErrorType,
     workflow_interceptors::WorkflowInterceptorConstructor,
     workflow_registry::{WorkflowDefinitions, WorkflowRegistrationError},
@@ -12,9 +13,9 @@ use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
 };
-use temporalio_client::{
-    ClientOptions, PluginApplyError, WorkflowHistory, errors::WorkflowInteractionError,
-};
+#[cfg(feature = "experimental")]
+use temporalio_client::PluginApplyError;
+use temporalio_client::{ClientOptions, WorkflowHistory, errors::WorkflowInteractionError};
 use temporalio_common::{
     WorkflowDefinition,
     data_converters::DataConverter,
@@ -30,7 +31,7 @@ use temporalio_sdk_core::{
     init_replay_worker,
     replay::{HistoryForReplay, ReplayWorkerInput},
 };
-use temporalio_workflow::{PatchActivationCallback, runtime::entry::WorkflowImplementation};
+use temporalio_workflow::runtime::entry::WorkflowImplementation;
 
 #[cfg(feature = "wasm-workflows")]
 use crate::WasmWorkflowComponent;
@@ -54,6 +55,7 @@ pub struct WorkflowReplayerOptions {
     pub(super) workflow_interceptor_constructors: Vec<WorkflowInterceptorConstructor>,
 
     #[builder(field)]
+    #[cfg(feature = "experimental")]
     pub(super) worker_plugins: Vec<Arc<dyn WorkerPlugin>>,
 
     #[cfg(feature = "wasm-workflows")]
@@ -83,21 +85,20 @@ pub struct WorkflowReplayerOptions {
     /// Whether to detect nondeterministic future usage in workflow code.
     #[builder(default = true)]
     pub detect_nondeterministic_futures: bool,
-
-    /// Callback controlling first non-replay patch decisions.
-    pub patch_activation_callback: Option<PatchActivationCallback>,
 }
 
 impl<S: workflow_replayer_options_builder::State> WorkflowReplayerOptionsBuilder<S> {
     /// Register a worker plugin with this replayer.
     ///
     /// **Experimental:** This API may change or be removed.
+    #[cfg(feature = "experimental")]
     pub fn worker_plugin<P: WorkerPlugin>(mut self, plugin: P) -> Self {
         self.worker_plugins.push(Arc::new(plugin));
         self
     }
 
     /// Append a worker interceptor used during replay.
+    #[cfg(feature = "experimental")]
     pub fn worker_interceptor<I: WorkerInterceptor + 'static>(mut self, interceptor: I) -> Self {
         self.worker_interceptors.push(Arc::new(interceptor));
         self
@@ -162,6 +163,7 @@ impl<S: workflow_replayer_options_builder::State> WorkflowReplayerOptionsBuilder
 
 impl WorkflowReplayerOptions {
     /// Append a worker interceptor used during replay.
+    #[cfg(feature = "experimental")]
     pub fn worker_interceptor<I: WorkerInterceptor + 'static>(
         &mut self,
         interceptor: I,
@@ -317,6 +319,7 @@ pub enum WorkflowReplayError {
 #[non_exhaustive]
 pub enum WorkflowReplayWorkerError {
     /// A plugin failed while configuring replay options.
+    #[cfg(feature = "experimental")]
     #[error(transparent)]
     Plugin(#[from] PluginApplyError),
     /// No workflow definitions were registered after plugin configuration.
@@ -346,7 +349,10 @@ pub struct WorkflowReplayer {
 
 impl WorkflowReplayer {
     /// Construct a replayer and apply its worker plugins.
-    pub fn new(mut options: WorkflowReplayerOptions) -> Result<Self, WorkflowReplayError> {
+    pub fn new(options: WorkflowReplayerOptions) -> Result<Self, WorkflowReplayError> {
+        #[cfg(feature = "experimental")]
+        let mut options = options;
+        #[cfg(feature = "experimental")]
         crate::plugins::apply_workflow_replayer_plugins(&mut options)
             .map_err(WorkflowReplayWorkerError::Plugin)?;
         if options.workflows.is_empty() {
@@ -479,11 +485,12 @@ impl WorkflowReplayer {
             .with_workflow_interceptor_constructors(
                 self.options.workflow_interceptor_constructors.clone(),
             )
-            .with_worker_plugins(self.options.worker_plugins.clone())
             .workflow_failure_errors(self.options.workflow_failure_errors.clone())
             .workflow_types_to_failure_errors(self.options.workflow_types_to_failure_errors.clone())
-            .detect_nondeterministic_futures(self.options.detect_nondeterministic_futures)
-            .maybe_patch_activation_callback(self.options.patch_activation_callback.clone());
+            .detect_nondeterministic_futures(self.options.detect_nondeterministic_futures);
+        #[cfg(feature = "experimental")]
+        let worker_options =
+            worker_options.with_worker_plugins(self.options.worker_plugins.clone());
         #[cfg(feature = "wasm-workflows")]
         let worker_options = worker_options
             .with_wasm_workflow_components(self.options.wasm_workflow_components.clone());
