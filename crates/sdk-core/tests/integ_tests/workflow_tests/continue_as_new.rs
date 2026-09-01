@@ -60,6 +60,55 @@ async fn continue_as_new_happy_path() {
     worker.run_until_done().await.unwrap();
 }
 
+#[workflow]
+#[derive(Default)]
+struct ContinueAsNewRandomWf;
+
+#[workflow_methods]
+impl ContinueAsNewRandomWf {
+    #[run]
+    async fn run(
+        ctx: &mut WorkflowContext<Self>,
+        previous_value: Option<u64>,
+    ) -> WorkflowResult<(u64, u64)> {
+        let value = ctx.random_stream("continue-as-new-test").random::<u64>();
+        if ctx.info().continued_from_run_id().is_none() {
+            ctx.continue_as_new(Some(value), ContinueAsNewOptions::default())?;
+        }
+        Ok((
+            previous_value.expect("first run should pass its stream value"),
+            value,
+        ))
+    }
+}
+
+#[tokio::test]
+async fn continue_as_new_reseeds_named_random_streams() {
+    let wf_name = "continue_as_new_reseeds_named_random_streams";
+    let mut starter = CoreWfStarter::new(wf_name);
+    starter
+        .sdk_config
+        .register_workflow::<ContinueAsNewRandomWf>()
+        .unwrap();
+    let mut worker = starter.worker().await;
+
+    let task_queue = starter.get_task_queue().to_owned();
+    let handle = worker
+        .submit_workflow(
+            ContinueAsNewRandomWf::run,
+            None,
+            WorkflowStartOptions::new(task_queue, wf_name).build(),
+        )
+        .await
+        .unwrap();
+    worker.run_until_done().await.unwrap();
+    let (first_value, continued_value) = handle.get_result(Default::default()).await.unwrap();
+    assert_ne!(
+        first_value, continued_value,
+        "continue-as-new should independently seed named streams"
+    );
+}
+
 #[tokio::test]
 async fn continue_as_new_multiple_concurrent() {
     let wf_name = "continue_as_new_multiple_concurrent";
