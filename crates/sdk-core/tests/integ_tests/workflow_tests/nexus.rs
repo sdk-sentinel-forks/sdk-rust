@@ -340,10 +340,10 @@ async fn nexus_async(
     let core_worker = starter.get_core_worker().await;
 
     let endpoint = mk_nexus_endpoint(&mut starter).await;
-    let schedule_to_close_timeout = if outcome == Outcome::CancelAfterRecordedBeforeStarted {
-        None
-    } else {
-        Some(Duration::from_secs(5))
+    let schedule_to_close_timeout = match outcome {
+        Outcome::CancelAfterRecordedBeforeStarted => None,
+        Outcome::Timeout => Some(Duration::from_secs(5)),
+        _ => Some(Duration::from_secs(60)),
     };
 
     let submitter = worker.get_submitter_handle();
