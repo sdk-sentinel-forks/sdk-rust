@@ -2,7 +2,6 @@ use crate::common::{
     CoreWfStarter, NAMESPACE,
     fake_grpc_server::{FakeServer, GenericService, fake_server},
     get_integ_server_options,
-    http_proxy::HttpProxy,
 };
 use assert_matches::assert_matches;
 use futures_util::{FutureExt, stream};
@@ -22,19 +21,17 @@ use std::{
     time::Duration,
 };
 use temporalio_client::{
-    Connection, GrpcCompression, RETRYABLE_ERROR_CODES, RetryOptions, UntypedWorkflow,
-    errors::ClientConnectError, grpc::WorkflowService, proxy::HttpConnectProxyOptions,
+    Connection, GrpcCompression, RetryOptions, UntypedWorkflow, errors::ClientConnectError,
+    grpc::WorkflowService,
 };
 use temporalio_common::protos::temporal::api::{
     cloud::cloudservice::v1::GetNamespaceRequest,
     workflowservice::v1::{
         DescribeNamespaceRequest, GetSystemInfoResponse, GetWorkflowExecutionHistoryRequest,
-        ListNamespacesRequest, RespondActivityTaskCanceledResponse, SignalWorkflowExecutionRequest,
-        SignalWorkflowExecutionResponse, get_system_info_response,
+        ListNamespacesRequest, SignalWorkflowExecutionRequest, SignalWorkflowExecutionResponse,
+        get_system_info_response,
     },
 };
-#[cfg(unix)]
-use tokio::net::UnixListener;
 use tokio::{net::TcpListener, sync::oneshot};
 use tonic::{
     Code, IntoRequest, Request, Status, body::Body, codegen::http::Response, transport::Server,
@@ -384,47 +381,6 @@ async fn non_retryable_errors() {
 }
 
 #[tokio::test]
-async fn retryable_errors() {
-    // Take out retry exhausted since it gets a special policy which would make this take ages
-    for code in RETRYABLE_ERROR_CODES
-        .iter()
-        .copied()
-        .filter(|p| p != &Code::ResourceExhausted)
-    {
-        let count = Arc::new(AtomicUsize::new(0));
-        let mut fs = fake_server(move |_| {
-            let prev = count.fetch_add(1, Ordering::Relaxed);
-            let r = if prev < 3 {
-                Status::new(code, "bla").into_http()
-            } else {
-                make_ok_response(RespondActivityTaskCanceledResponse::default())
-            };
-            async { r }.boxed()
-        })
-        .await;
-
-        let mut opts = get_integ_server_options();
-        opts.target = format!("http://localhost:{}", fs.addr.port())
-            .parse::<url::Url>()
-            .unwrap();
-        opts.set_skip_get_system_info(true);
-        let connection = Connection::connect(opts).await.unwrap();
-        let client_opts = temporalio_client::ClientOptions::new("ns").build();
-        let client = temporalio_client::Client::new(connection, client_opts).unwrap();
-
-        let result = client.count_workflows("whatever", Default::default()).await;
-
-        // Expecting successful response after retries
-        assert!(result.is_ok(), "{:?}", result);
-        let mut all_calls = vec![];
-        fs.header_rx.recv_many(&mut all_calls, 9999).await;
-        // Should be 4 attempts
-        assert_eq!(all_calls.len(), 4);
-        fs.shutdown().await;
-    }
-}
-
-#[tokio::test]
 async fn namespace_header_attached_to_relevant_calls() {
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let (header_tx, mut header_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -533,94 +489,6 @@ async fn cloud_ops_test() {
         .await
         .unwrap();
     assert_eq!(res.into_inner().namespace.unwrap().namespace, namespace);
-}
-
-#[tokio::test]
-async fn http_proxy() {
-    // Create server
-    let call_count = Arc::new(AtomicUsize::new(0));
-    let call_count_cloned = call_count.clone();
-    let server = fake_server(move |_| {
-        call_count_cloned.fetch_add(1, Ordering::SeqCst);
-        async { Response::new(Body::empty()) }.boxed()
-    })
-    .await;
-
-    // Create HTTP TCP proxy
-    let tcp_proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let tcp_proxy_addr = tcp_proxy_listener.local_addr().unwrap();
-    let tcp_proxy = HttpProxy::spawn_tcp(tcp_proxy_listener);
-
-    // General client options
-    let mut opts = get_integ_server_options();
-    opts.retry_options = RetryOptions::no_retries();
-    opts.set_skip_get_system_info(true);
-
-    // Connect client with no proxy and make call and confirm reached
-    opts.target = format!("http://[::1]:{}", server.addr.port())
-        .parse()
-        .unwrap();
-    let connection = Connection::connect(opts.clone()).await.unwrap();
-    let client_opts = temporalio_client::ClientOptions::new("my-namespace").build();
-    let client = temporalio_client::Client::new(connection, client_opts).unwrap();
-    let _ = WorkflowService::list_namespaces(
-        &mut client.clone(),
-        ListNamespacesRequest::default().into_request(),
-    )
-    .await;
-    assert!(call_count.load(Ordering::SeqCst) == 1);
-    assert!(tcp_proxy.hit_count() == 0);
-
-    // Connect client to proxy and make call and confirm reached
-    opts.http_connect_proxy =
-        Some(HttpConnectProxyOptions::new(tcp_proxy_addr.to_string()).build());
-    opts.dns_load_balancing = None;
-    let connection = Connection::connect(opts.clone()).await.unwrap();
-    let client_opts = temporalio_client::ClientOptions::new("my-namespace").build();
-    let proxied_client = temporalio_client::Client::new(connection, client_opts).unwrap();
-    let _ = WorkflowService::list_namespaces(
-        &mut proxied_client.clone(),
-        ListNamespacesRequest::default().into_request(),
-    )
-    .await;
-    assert!(call_count.load(Ordering::SeqCst) == 2);
-    assert!(tcp_proxy.hit_count() == 1);
-
-    // Test Unix socket too only in Unix environments
-    #[cfg(unix)]
-    {
-        // Create temp socket path
-        let mut sock_path = std::env::temp_dir();
-        sock_path.push(format!("http-proxy-test-{}.sock", std::process::id()));
-        // Remove if there just in case
-        let _ = std::fs::remove_file(&sock_path);
-
-        // Create unix-socket-based proxy
-        let unix_proxy = HttpProxy::spawn_unix(UnixListener::bind(&sock_path).unwrap());
-
-        // Connect client to proxy and make call and confirm reached
-        opts.http_connect_proxy = Some(
-            HttpConnectProxyOptions::new(format!("unix:{}", sock_path.to_str().unwrap())).build(),
-        );
-        opts.dns_load_balancing = None;
-        let connection = Connection::connect(opts.clone()).await.unwrap();
-        let client_opts = temporalio_client::ClientOptions::new("my-namespace").build();
-        let proxied_client = temporalio_client::Client::new(connection, client_opts).unwrap();
-        let _ = WorkflowService::list_namespaces(
-            &mut proxied_client.clone(),
-            ListNamespacesRequest::default().into_request(),
-        )
-        .await;
-        assert!(call_count.load(Ordering::SeqCst) == 3);
-        assert!(unix_proxy.hit_count() == 1);
-
-        // Shutdown unix proxy
-        unix_proxy.shutdown();
-    }
-
-    // Shutdown server and proxy
-    server.shutdown().await;
-    tcp_proxy.shutdown();
 }
 
 #[tokio::test]

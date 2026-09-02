@@ -12,7 +12,8 @@ pub use temporalio_macros::{
 
 #[doc(hidden)]
 pub mod __private {
-    pub use futures_util;
+    // Rexports used by macros
+    pub use futures_util::{FutureExt, future::LocalBoxFuture, join, select_biased};
 }
 
 mod cancellation;
@@ -25,8 +26,6 @@ pub mod workflow_interceptors;
 pub mod workflows;
 
 pub use cancellation::{WorkflowCancellationError, WorkflowCancellationToken};
-#[doc(hidden)]
-pub use runtime::model::{CancellableID, UnblockEvent};
 pub use runtime::model::{TimerResult, WorkflowResult, WorkflowTermination};
 #[doc(hidden)]
 pub use runtime::{SdkWakeGuard, is_sdk_wake};
@@ -61,7 +60,7 @@ pub use workflows::{join, join_all, select};
 #[doc(hidden)]
 macro_rules! __temporal_select {
     ($($tokens:tt)*) => {
-        $crate::__private::futures_util::select_biased! { $($tokens)* }
+        $crate::__private::select_biased! { $($tokens)* }
     };
 }
 
@@ -69,7 +68,7 @@ macro_rules! __temporal_select {
 #[doc(hidden)]
 macro_rules! __temporal_join {
     ($($tokens:tt)*) => {
-        $crate::__private::futures_util::join!($($tokens)*)
+        $crate::__private::join!($($tokens)*)
     };
 }
 
