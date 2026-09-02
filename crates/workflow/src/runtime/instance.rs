@@ -615,6 +615,7 @@ where
             let validation_input =
                 ValidateUpdateInput::new(id.clone(), name.clone(), decoded_input, headers.clone());
             let guard = self.base_ctx.track_handler();
+            let _read_only = self.base_ctx.enter_read_only();
             let validation_ctx = SyncWorkflowInterceptorContext::new(self.base_ctx.clone());
             let workflow_ctx = self.ctx.clone();
             let validation_next = WorkflowNext::new(move |input: ValidateUpdateInput| {
@@ -721,6 +722,7 @@ where
             decoded_input,
             query.headers,
         );
+        let _read_only = self.base_ctx.enter_read_only();
         let interceptor_ctx = SyncWorkflowInterceptorContext::new(self.base_ctx.clone());
         let workflow_ctx = self.ctx.clone();
         let query_next = WorkflowNext::new(move |input: HandleQueryInput| {
@@ -1199,7 +1201,7 @@ mod tests {
     use std::{
         cell::Cell,
         rc::Rc,
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::atomic::{AtomicU64, AtomicUsize, Ordering},
         task::Waker,
     };
     use temporalio_common_wasm::{
@@ -1460,13 +1462,19 @@ mod tests {
     fn interceptor_constructors_run_before_workflow_input_decoding() {
         let constructor_calls = Arc::new(AtomicUsize::new(0));
         let execute_calls = Arc::new(AtomicUsize::new(0));
+        let constructor_random = Arc::new(AtomicU64::new(0));
         let constructor_calls_ref = constructor_calls.clone();
         let execute_calls_ref = execute_calls.clone();
+        let constructor_random_ref = constructor_random.clone();
         let constructor = WorkflowInterceptorConstructor::new(move |ctx| {
             assert_eq!(ctx.namespace(), "default");
             assert_eq!(ctx.task_queue(), "task-queue");
             assert_eq!(ctx.run_id(), "run-id");
             assert_eq!(ctx.workflow_type(), DecodeFailureWorkflow::name());
+            constructor_random_ref.store(
+                ctx.random_stream("plugin").random::<u64>(),
+                Ordering::Relaxed,
+            );
             constructor_calls_ref.fetch_add(1, Ordering::Relaxed);
             CountingExecuteInterceptor {
                 calls: execute_calls_ref.clone(),
@@ -1478,9 +1486,20 @@ mod tests {
             run_id: "run-id".to_string(),
             initialize_workflow: InitializeWorkflow {
                 workflow_type: DecodeFailureWorkflow::name().to_string(),
+                randomness_seed: 42,
                 ..Default::default()
             },
         };
+        let expected_base_ctx = BaseWorkflowContext::from_raw(
+            init.clone(),
+            DataConverter::default(),
+            Rc::new(NoopHost),
+            None,
+            Vec::new(),
+        );
+        let expected_random = expected_base_ctx.random_stream("plugin");
+        let expected_constructor_random = expected_random.random::<u64>();
+        let expected_next_random = expected_random.random::<u64>();
         let base_ctx = BaseWorkflowContext::from_raw(
             init,
             DataConverter::default(),
@@ -1488,6 +1507,7 @@ mod tests {
             None,
             vec![constructor],
         );
+        let next_random = base_ctx.random_stream("plugin").random::<u64>();
 
         let result = GuestWorkflowInstance::<DecodeFailureWorkflow>::instantiate(
             vec![Payload::default()],
@@ -1498,5 +1518,10 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(constructor_calls.load(Ordering::Relaxed), 1);
         assert_eq!(execute_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            constructor_random.load(Ordering::Relaxed),
+            expected_constructor_random
+        );
+        assert_eq!(next_random, expected_next_random);
     }
 }

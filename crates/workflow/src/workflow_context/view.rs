@@ -1,4 +1,9 @@
-use std::time::{Duration, SystemTime};
+use super::{WorkflowRandomState, WorkflowRandomStream, WorkflowRandomStreamSource};
+use std::{
+    cell::RefCell,
+    rc::Rc,
+    time::{Duration, SystemTime},
+};
 
 use temporalio_common_wasm::{
     Memo, Priority, RetryPolicy, WorkflowExecution,
@@ -20,6 +25,8 @@ pub struct WorkflowContextView {
     task_queue: String,
     run_id: String,
     payload_converter: PayloadConverter,
+    requires_replay_safety: bool,
+    workflow_random: Option<Rc<RefCell<WorkflowRandomState>>>,
 }
 
 impl WorkflowContextView {
@@ -30,6 +37,8 @@ impl WorkflowContextView {
         run_id: String,
         raw: InitializeWorkflow,
         payload_converter: PayloadConverter,
+        requires_replay_safety: bool,
+        workflow_random: Option<Rc<RefCell<WorkflowRandomState>>>,
     ) -> Self {
         Self {
             raw,
@@ -37,6 +46,8 @@ impl WorkflowContextView {
             task_queue,
             run_id,
             payload_converter,
+            requires_replay_safety,
+            workflow_random,
         }
     }
 
@@ -154,6 +165,26 @@ impl WorkflowContextView {
             .search_attributes
             .as_ref()
             .map(SearchAttributes::from_proto)
+    }
+
+    #[allow(
+        dead_code,
+        reason = "used by SDK-provided interceptors built separately from this change"
+    )]
+    pub(crate) fn random_stream(&self, name: impl Into<String>) -> WorkflowRandomStream {
+        let source = if self.requires_replay_safety {
+            WorkflowRandomStreamSource::Workflow(
+                self.workflow_random
+                    .clone()
+                    .expect("replay-safe context views must have workflow randomness"),
+            )
+        } else {
+            super::system_random_stream_source()
+        };
+        WorkflowRandomStream {
+            source,
+            name: name.into(),
+        }
     }
 
     /// Accesses the underlying workflow initialization protobuf.
