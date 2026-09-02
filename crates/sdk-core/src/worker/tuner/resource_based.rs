@@ -778,7 +778,6 @@ mod tests {
             Arc,
             atomic::{AtomicU64, Ordering},
         },
-        thread::sleep,
     };
 
     struct FakeMIS {
@@ -1205,8 +1204,8 @@ mod tests {
         let to_allocate: usize = (half_total).saturating_sub(cur_used) as usize;
         let _buf = black_box(vec![1u8; to_allocate]);
 
-        // make sure we sleep enough to let real_sys_info need a refresh
-        sleep(Duration::from_millis(200));
+        // Refresh synchronously so the assertion cannot race the background sampler.
+        sys_info.inner.refresh();
 
         let percentage = sys_info.used_mem_percent();
         let diff = (percentage - expected_percentage).abs();
