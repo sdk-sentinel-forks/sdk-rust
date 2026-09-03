@@ -89,10 +89,10 @@ pub use crate::plugins::{
 };
 pub use crate::{
     error::{
-        ActivityExecutionError, ApplicationFailure, ChildWorkflowExecutionError,
-        ChildWorkflowStartError, OutgoingActivityError, OutgoingError, OutgoingWorkflowError,
-        RetryState, TimeoutType, WorkerCreateError, WorkerRunError, WorkerValidationError,
-        WorkflowRegistrationError, WorkflowSignalError,
+        ActivityExecutionError, ApplicationFailure, CancelExternalWorkflowError,
+        ChildWorkflowExecutionError, ChildWorkflowStartError, OutgoingActivityError, OutgoingError,
+        OutgoingWorkflowError, RetryState, TimeoutType, WorkerCreateError, WorkerRunError,
+        WorkerValidationError, WorkflowRegistrationError, WorkflowSignalError,
     },
     workflow_registry::WorkflowDefinitions,
 };
@@ -163,9 +163,7 @@ use temporalio_common::{
     worker::{WorkerDeploymentOptions, WorkerTaskTypes, build_id_from_current_exe},
 };
 use temporalio_sdk_core::{PollError, init_worker};
-use temporalio_workflow::{
-    InternalPatchActivationCallback, runtime::entry::WorkflowImplementation,
-};
+use temporalio_workflow::{InternalPatchActivationCallback, workflows::WorkflowImplementation};
 use tokio::sync::{
     Notify,
     mpsc::{UnboundedSender, unbounded_channel},

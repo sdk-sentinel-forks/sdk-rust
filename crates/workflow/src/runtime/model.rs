@@ -15,8 +15,8 @@ use temporalio_common_wasm::{
     WorkflowDefinition,
     data_converters::{PayloadConversionError, TemporalSerializable},
     error::{
-        ActivityExecutionError, ApplicationFailure, ChildWorkflowExecutionError,
-        ChildWorkflowStartError, WorkflowSignalError,
+        ActivityExecutionError, ApplicationFailure, CancelExternalWorkflowError,
+        ChildWorkflowExecutionError, ChildWorkflowStartError, WorkflowSignalError,
     },
     protos::{
         coresdk::{
@@ -56,15 +56,15 @@ pub enum TimerResult {
 
 /// Successful result of sending a signal to an external workflow
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SignalExternalOk;
+pub(crate) struct SignalExternalOk;
 /// Result of awaiting on sending a signal to an external workflow
-pub type SignalExternalWfResult = Result<SignalExternalOk, Failure>;
+pub(crate) type SignalExternalWfResult = Result<SignalExternalOk, Failure>;
 
-/// Successful result of sending a cancel request to an external workflow
+/// Distinguishes external cancellation resolutions from other command results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CancelExternalOk;
-/// Result of awaiting on sending a cancel request to an external workflow
-pub type CancelExternalWfResult = Result<CancelExternalOk, Failure>;
+pub(crate) struct CancelExternalOk;
+/// Internal result delivered when an external cancellation command resolves.
+pub(crate) type CancelExternalWfResult = Result<CancelExternalOk, Failure>;
 
 pub(crate) trait Unblockable {
     type OtherDat;
@@ -179,16 +179,20 @@ pub type WorkflowResult<T> = Result<T, WorkflowTermination>;
 /// Wrap an error in an [`ApplicationFailure`] to explicitly fail the Workflow Execution.
 #[derive(derive_more::Debug, thiserror::Error)]
 pub enum WorkflowTermination {
+    /// The Workflow Execution was cancelled, optionally with user-supplied details.
     #[error("Workflow cancelled")]
     Cancelled {
         /// Optional cancellation details.
         #[debug(skip)]
         details: Option<Box<dyn WorkflowOutputValue + Send + Sync>>,
     },
+    /// The workflow was evicted and must stop without producing a completion command.
     #[error("Workflow evicted from cache")]
     Evicted,
+    /// The workflow requested a new run with the supplied command attributes.
     #[error("Continue as new")]
     ContinueAsNew(Box<ContinueAsNewRequest>),
+    /// The Workflow Execution failed with an error already converted for outbound handling.
     #[error("Workflow failed: {0}")]
     Failed(#[source] temporalio_common_wasm::error::OutgoingWorkflowError),
 }
@@ -210,6 +214,7 @@ impl WorkflowTermination {
         }
     }
 
+    /// Constructs a termination that asks the worker to continue the workflow as a new run.
     pub fn continue_as_new(can: ContinueAsNewRequest) -> Self {
         Self::ContinueAsNew(Box::new(can))
     }
@@ -256,6 +261,12 @@ impl From<WorkflowSignalError> for WorkflowTermination {
     }
 }
 
+impl From<CancelExternalWorkflowError> for WorkflowTermination {
+    fn from(value: CancelExternalWorkflowError) -> Self {
+        Self::Failed(value.into())
+    }
+}
+
 impl From<ChildWorkflowStartError> for WorkflowTermination {
     fn from(value: ChildWorkflowStartError) -> Self {
         Self::Failed(value.into())
@@ -278,6 +289,7 @@ mod tests {
     #[case::child_start(ChildWorkflowStartError::Serialization(conversion_error()))]
     #[case::child_execution(ChildWorkflowExecutionError::Serialization(conversion_error()))]
     #[case::signal(WorkflowSignalError::Serialization(conversion_error()))]
+    #[case::cancel_external(CancelExternalWorkflowError::Serialization(conversion_error()))]
     fn conversion_error_is_preserved_in_workflow_termination<T: Into<WorkflowTermination>>(
         #[case] error: T,
     ) {

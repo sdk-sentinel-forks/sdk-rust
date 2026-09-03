@@ -12,15 +12,10 @@ use temporalio_common::{
     },
 };
 use temporalio_workflow::{
+    __private::sdk::{GuestWorkflowInstance, WorkflowHost, WorkflowInit, WorkflowInstance},
     BaseWorkflowContext, InternalPatchActivationCallback as PatchActivationCallback,
-    runtime::{
-        entry::WorkflowImplementation,
-        guest::WorkflowInstance,
-        host::WorkflowHost,
-        instance::{GuestWorkflowInstance, instantiate_workflow},
-        types::{WorkflowDefinitionDescriptor, WorkflowInit},
-    },
     workflow_interceptors::WorkflowInterceptorConstructor,
+    workflows::{WorkflowDefinitionDescriptor, WorkflowImplementation},
 };
 
 /// Host-owned execution inputs used to instantiate a single workflow run.
@@ -100,7 +95,7 @@ impl WorkflowDefinitions {
     {
         let factory = Arc::new(move |input| {
             let (payloads, payload_converter, base_ctx) = workflow_input_parts(input);
-            instantiate_workflow::<W>(payloads, payload_converter, base_ctx)
+            GuestWorkflowInstance::<W>::instantiate(payloads, payload_converter, base_ctx)
                 .context("Failed to instantiate native workflow")
         });
         self.insert_workflow(W::definition(), factory)?;

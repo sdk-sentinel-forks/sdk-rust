@@ -13,12 +13,12 @@ use std::{
     task::{Context, Poll},
 };
 
-pub mod entry;
-pub mod guest;
-pub mod host;
-pub mod instance;
-pub mod model;
-pub mod types;
+pub(crate) mod entry;
+pub(crate) mod guest;
+pub(crate) mod host;
+pub(crate) mod instance;
+pub(crate) mod model;
+pub(crate) mod types;
 
 thread_local! {
     static SDK_WAKE_DEPTH: Cell<u32> = const { Cell::new(0) };
@@ -238,18 +238,23 @@ pub(crate) fn mark_intercepted_handler_ready() {
 }
 
 /// Guard that marks the current scope as an SDK-initiated wake source.
-#[doc(hidden)]
-pub struct SdkWakeGuard {
+pub(crate) struct SdkWakeGuard {
     _not_send_or_sync: PhantomData<Rc<()>>,
 }
 
 impl SdkWakeGuard {
-    #[doc(hidden)]
-    pub fn new() -> Self {
+    /// Enters an SDK wake scope until the returned guard is dropped.
+    pub(crate) fn new() -> Self {
         SDK_WAKE_DEPTH.with(|c| c.set(c.get() + 1));
         Self {
             _not_send_or_sync: PhantomData,
         }
+    }
+}
+
+impl Default for SdkWakeGuard {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -259,7 +264,7 @@ impl Drop for SdkWakeGuard {
     }
 }
 
-#[doc(hidden)]
+/// Reports whether the current thread is inside an SDK-initiated wake scope.
 pub fn is_sdk_wake() -> bool {
     SDK_WAKE_DEPTH.with(|c| c.get() > 0)
 }
@@ -274,5 +279,45 @@ impl<F: Future + Unpin> Future for SdkGuardedFuture<F> {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let _guard = SdkWakeGuard::new();
         Pin::new(&mut self.0).poll(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sdk_wake_guard_nesting() {
+        assert!(!is_sdk_wake());
+
+        {
+            let _guard1 = SdkWakeGuard::new();
+            assert!(is_sdk_wake());
+            {
+                let _guard2 = SdkWakeGuard::new();
+                assert!(is_sdk_wake());
+            }
+            assert!(is_sdk_wake());
+        }
+        assert!(!is_sdk_wake());
+    }
+
+    #[test]
+    fn sdk_wake_guard_panic_safety() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = SdkWakeGuard::new();
+            panic!("test panic");
+        }));
+        assert!(result.is_err());
+        assert!(!is_sdk_wake());
+    }
+
+    #[test]
+    fn sdk_wake_guard_is_thread_local() {
+        let _guard = SdkWakeGuard::new();
+        assert!(is_sdk_wake());
+
+        let child_is_sdk_wake = std::thread::spawn(is_sdk_wake).join().unwrap();
+        assert!(!child_is_sdk_wake);
     }
 }
