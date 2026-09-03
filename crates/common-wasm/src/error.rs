@@ -1164,6 +1164,9 @@ impl ChildWorkflowExecutionError {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum WorkflowSignalError {
+    /// The target workflow was not found.
+    #[error("Workflow not found: {}", .0.failure().message)]
+    NotFound(#[source] Box<WorkflowSignalFailureError>),
     /// The signal delivery failed.
     #[error("Child workflow signal failed: {}", .0.failure().message)]
     Failed(#[source] Box<WorkflowSignalFailureError>),
@@ -1175,9 +1178,12 @@ pub enum WorkflowSignalError {
 /// Error returned when requesting cancellation of an external workflow fails.
 #[derive(Debug, thiserror::Error)]
 pub enum CancelExternalWorkflowError {
+    /// The target workflow was not found.
+    #[error("Workflow not found: {}", .0.failure().message)]
+    NotFound(#[source] Box<WorkflowCancelFailureError>),
     /// The cancellation request failed.
     #[error("External workflow cancellation request failed: {}", .0.failure().message)]
-    Failed(#[source] Box<IncomingError>),
+    Failed(#[source] Box<WorkflowCancelFailureError>),
     /// Failed to deserialize payloads attached to the cancellation failure.
     #[error("External workflow cancellation failure conversion failed: {0}")]
     Serialization(#[from] PayloadConversionError),
@@ -1187,7 +1193,7 @@ impl CancelExternalWorkflowError {
     /// Returns the retained top-level cancellation failure proto, if one exists.
     pub fn failure(&self) -> Option<&Failure> {
         match self {
-            Self::Failed(err) => Some(err.failure()),
+            Self::NotFound(err) | Self::Failed(err) => Some(err.failure()),
             Self::Serialization(_) => None,
         }
     }
@@ -1195,7 +1201,7 @@ impl CancelExternalWorkflowError {
     /// Returns the normalized cause of the cancellation failure, if any.
     pub fn cause(&self) -> Option<&IncomingError> {
         match self {
-            Self::Failed(err) => err.cause(),
+            Self::NotFound(err) | Self::Failed(err) => err.cause(),
             Self::Serialization(_) => None,
         }
     }
@@ -1203,7 +1209,7 @@ impl CancelExternalWorkflowError {
     /// Returns the normalized cancellation failure itself, if one exists.
     pub fn reason(&self) -> Option<&IncomingError> {
         match self {
-            Self::Failed(err) => Some(err),
+            Self::NotFound(err) | Self::Failed(err) => Some(err.error()),
             Self::Serialization(_) => None,
         }
     }
@@ -1218,7 +1224,9 @@ impl WorkflowSignalError {
     /// Returns the retained top-level workflow signal failure proto, if one exists.
     pub fn failure(&self) -> Option<&Failure> {
         match self {
-            WorkflowSignalError::Failed(err) => Some(err.failure()),
+            WorkflowSignalError::NotFound(err) | WorkflowSignalError::Failed(err) => {
+                Some(err.failure())
+            }
             WorkflowSignalError::Serialization(_) => None,
         }
     }
@@ -1226,7 +1234,7 @@ impl WorkflowSignalError {
     /// Returns the normalized cause of the workflow signal failure, if any.
     pub fn cause(&self) -> Option<&IncomingError> {
         match self {
-            WorkflowSignalError::Failed(err) => err.cause(),
+            WorkflowSignalError::NotFound(err) | WorkflowSignalError::Failed(err) => err.cause(),
             WorkflowSignalError::Serialization(_) => None,
         }
     }
@@ -1234,7 +1242,9 @@ impl WorkflowSignalError {
     /// Returns the underlying failure reason for wrapper-shaped signal failures.
     pub fn reason(&self) -> Option<&IncomingError> {
         match self {
-            WorkflowSignalError::Failed(err) => Some(err.error()),
+            WorkflowSignalError::NotFound(err) | WorkflowSignalError::Failed(err) => {
+                Some(err.error())
+            }
             WorkflowSignalError::Serialization(_) => None,
         }
     }
@@ -1285,6 +1295,51 @@ impl std::fmt::Display for WorkflowSignalFailureError {
 }
 
 impl std::error::Error for WorkflowSignalFailureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.cause()
+            .map(|cause| cause as &(dyn std::error::Error + 'static))
+    }
+}
+
+/// A normalized external workflow cancellation failure wrapper.
+#[derive(Debug)]
+pub struct WorkflowCancelFailureError {
+    failure: Failure,
+    error: Box<IncomingError>,
+}
+
+impl WorkflowCancelFailureError {
+    /// Creates an external workflow cancellation failure wrapper.
+    pub(crate) fn new(failure: Failure, error: IncomingError) -> Self {
+        Self {
+            failure,
+            error: Box::new(error),
+        }
+    }
+
+    /// Returns the retained top-level proto failure.
+    pub fn failure(&self) -> &Failure {
+        &self.failure
+    }
+
+    /// Returns the normalized direct cause of the external workflow cancellation failure, if any.
+    pub fn cause(&self) -> Option<&IncomingError> {
+        self.error.cause()
+    }
+
+    /// Returns the direct decoded incoming error represented by the top-level proto failure.
+    pub fn error(&self) -> &IncomingError {
+        &self.error
+    }
+}
+
+impl std::fmt::Display for WorkflowCancelFailureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.failure.fmt(f)
+    }
+}
+
+impl std::error::Error for WorkflowCancelFailureError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         self.cause()
             .map(|cause| cause as &(dyn std::error::Error + 'static))
