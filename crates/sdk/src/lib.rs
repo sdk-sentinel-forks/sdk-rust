@@ -887,6 +887,7 @@ impl Worker {
     }
 
     // TODO [rust-sdk-branch]: Eliminate this constructor in favor of passing in fake connection
+    #[cfg(feature = "experimental")]
     #[doc(hidden)]
     pub fn new_from_core(worker: Arc<CoreWorker>, data_converter: DataConverter) -> Self {
         let client_options = ClientOptions::new(worker.get_config().namespace.clone())
@@ -904,6 +905,7 @@ impl Worker {
     }
 
     // TODO [rust-sdk-branch]: Eliminate this constructor in favor of passing in fake connection
+    #[cfg(feature = "experimental")]
     #[doc(hidden)]
     pub fn new_from_core_options(
         worker: Arc<CoreWorker>,
@@ -1305,11 +1307,6 @@ impl Worker {
     /// Returns the instance key for this worker, used for worker heartbeating.
     pub fn worker_instance_key(&self) -> Uuid {
         self.common.worker.worker_instance_key()
-    }
-
-    #[doc(hidden)]
-    pub fn core_worker(&self) -> Arc<CoreWorker> {
-        self.common.worker.clone()
     }
 
     fn split_apart(&mut self) -> (&mut CommonWorker, &mut WorkflowHalf, &mut ActivityHalf) {
