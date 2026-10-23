@@ -32,6 +32,7 @@ use temporalio_common::{
         coresdk::workflow_activation::remove_from_cache::EvictionReason,
         temporal::api::{
             common::v1::WorkflowExecution,
+            enums::v1::WorkflowTaskFailedCause,
             history::v1::History,
             workflowservice::v1::{
                 DescribeNamespaceResponse, RespondWorkflowTaskCompletedResponse,
@@ -136,8 +137,10 @@ where
             });
         client
             .expect_fail_workflow_task()
-            .returning(move |_, _, _| {
-                hist_allow_tx.send("Failed".to_string()).unwrap();
+            .returning(move |_, cause, _| {
+                if cause != WorkflowTaskFailedCause::NonDeterministicError {
+                    hist_allow_tx.send("Failed".to_string()).unwrap();
+                }
                 async move { Ok(RespondWorkflowTaskFailedResponse::default()) }.boxed()
             });
         let mut worker = Worker::new(self.config, None, Arc::new(client), None, None, None)?;
