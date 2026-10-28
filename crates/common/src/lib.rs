@@ -7,10 +7,8 @@
 #[macro_use]
 extern crate tracing;
 
-pub mod data_converters;
 #[cfg(feature = "envconfig")]
 pub mod envconfig;
-#[cfg(feature = "experimental")]
 pub(crate) mod external_storage_references;
 #[cfg(feature = "experimental")]
 pub(crate) mod external_storage_runner;
@@ -26,7 +24,8 @@ pub use temporalio_common_wasm::{
     ActivityCloseTimeouts, ActivityDefinition, ActivityError, HasWorkflowDefinition, Memo,
     MemoValue, MemoValues, Priority, QueryDefinition, RetryPolicy, SignalDefinition,
     UntypedActivity, UntypedWorkflow, UpdateDefinition, VersioningOverride,
-    WorkerDeploymentVersion, WorkflowDefinition, WorkflowExecution, error, search_attributes,
+    WorkerDeploymentVersion, WorkflowDefinition, WorkflowExecution, data_converters, error,
+    search_attributes,
 };
 
 macro_rules! dbg_panic {
