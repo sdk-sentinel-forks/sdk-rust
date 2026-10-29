@@ -144,7 +144,7 @@ use std::{
 };
 use temporalio_client::{Client, ClientOptions, NamespacedClient};
 #[cfg(feature = "experimental")]
-use temporalio_common::protos::temporal::api::worker::v1::PluginInfo;
+use temporalio_common::protos::temporal::api::worker::v1::{PluginInfo, StorageDriverInfo};
 use temporalio_common::{
     ActivityDefinition, WorkflowDefinition,
     data_converters::{
@@ -666,6 +666,7 @@ impl WorkerOptions {
         &self,
         namespace: String,
         connection_identity: String,
+        data_converter: &DataConverter,
     ) -> Result<WorkerConfig, String> {
         let workflows_registered = !self.workflows.is_empty();
         #[cfg(feature = "wasm-workflows")]
@@ -694,6 +695,20 @@ impl WorkerOptions {
             .collect();
         #[cfg(not(feature = "experimental"))]
         let plugin_info = HashSet::new();
+        #[cfg(feature = "experimental")]
+        let storage_drivers = data_converter
+            .external_storage()
+            .into_iter()
+            .flat_map(|external_storage| external_storage.drivers())
+            .map(|driver| StorageDriverInfo {
+                r#type: driver.driver_type().to_owned(),
+            })
+            .collect();
+        #[cfg(not(feature = "experimental"))]
+        let storage_drivers = {
+            let _ = data_converter;
+            HashSet::new()
+        };
 
         let tuner = self.tuner.to_core()?;
 
@@ -764,6 +779,7 @@ impl WorkerOptions {
                     .collect(),
             )
             .plugins(plugin_info)
+            .storage_drivers(storage_drivers)
             .disable_payload_error_limit(disable_payload_error_limit)
             .build()
     }
@@ -926,7 +942,11 @@ impl Worker {
         #[cfg(feature = "experimental")]
         plugins::apply_worker_plugins(client.options(), &mut options)?;
         let wc = options
-            .to_core_options(client.namespace(), client.identity())
+            .to_core_options(
+                client.namespace(),
+                client.identity(),
+                &client.options().data_converter,
+            )
             .map_err(|error| WorkerCreateError::Initialization(anyhow!(error)))?;
         let core = init_worker(runtime.core(), wc, client.connection().clone())
             .map_err(WorkerCreateError::Initialization)?;
@@ -1770,7 +1790,11 @@ mod tests {
             .build();
         options.worker_interceptors.push(observer);
         let core_options = options
-            .to_core_options("test_namespace".to_owned(), String::new())
+            .to_core_options(
+                "test_namespace".to_owned(),
+                String::new(),
+                &DataConverter::default(),
+            )
             .unwrap();
         let core = init_replay_worker(ReplayWorkerInput::new(core_options, histories)).unwrap();
         Worker::new_from_core_options_prepared(
@@ -2239,7 +2263,7 @@ mod tests {
 
         let actual = options
             .build()
-            .to_core_options("ns".into(), String::new())
+            .to_core_options("ns".into(), String::new(), &DataConverter::default())
             .map(|config| config.task_types);
         assert_eq!(
             actual.as_ref().map_err(String::as_str),
@@ -2330,7 +2354,11 @@ mod tests {
             .maybe_client_identity_override(worker_override.map(|s| s.to_owned()))
             .build();
         let config = opts
-            .to_core_options("ns".into(), connection_identity.into())
+            .to_core_options(
+                "ns".into(),
+                connection_identity.into(),
+                &DataConverter::default(),
+            )
             .unwrap();
         assert_eq!(config.client_identity_override, expected);
     }
@@ -2341,7 +2369,7 @@ mod tests {
             .register_activities(MyActivities {})
             .max_eager_activity_reservations_per_workflow_task(7)
             .build()
-            .to_core_options("ns".into(), String::new())
+            .to_core_options("ns".into(), String::new(), &DataConverter::default())
             .unwrap();
         assert_eq!(config.max_eager_activity_reservations_per_workflow_task, 7);
     }
@@ -2387,7 +2415,7 @@ mod tests {
                 .register_activities(MyActivities {})
                 .maybe_disable_payload_error_limit(override_value)
                 .build()
-                .to_core_options("ns".into(), String::new())
+                .to_core_options("ns".into(), String::new(), &DataConverter::default())
                 .unwrap();
             assert_eq!(config.disable_payload_error_limit, expected);
         }
